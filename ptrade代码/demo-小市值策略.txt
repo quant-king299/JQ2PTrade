@@ -1,0 +1,129 @@
+def initialize(context):
+    # 设置基准为沪深300
+    set_benchmark('000300.SS')
+    # 初始化变量
+    g.security = []  # 初始化成分股列表
+    g.max_hold_num = 5  # 设置最大持有股票数量为5
+    # 设置买入条件
+    g.buy_conditions = {
+        'rsi6': 50,
+        'volume_ratio': 2
+    }
+    # 设置卖出条件
+    g.sell_conditions = {
+        'max_drawdown': 0.05,
+        'cost_drawdown': 0.05
+    }
+    # 初始化持仓
+    g.positions = []
+
+def before_trading_start(context, data):
+    # 获取沪深300成分股
+    # g.security = get_index_stocks('000300.SS')
+    # 获取今日日期
+    g.current_date = context.blotter.current_dt.strftime("%Y%m%d")
+    # 获取当日A股代码列表
+    g.security = get_Ashares(g.current_date)
+    # 过滤掉ST、停牌、退市的股票
+    g.filtered_stocks = []
+    for stock in g.security:
+        status = get_stock_status([stock], 'ST')
+        if not status[stock]:
+            g.filtered_stocks.append(stock)
+            
+    print(len(g.filtered_stocks));
+
+def handle_data(context, data):
+    # 获取当前持仓
+    current_positions = get_positions()
+    # 检查卖出条件
+    for stock in g.positions:
+        if check_sell_conditions(stock, current_positions):
+            order_target(stock, 0)
+            g.positions.remove(stock)
+    # 检查买入条件
+    if len(g.positions) < g.max_hold_num:
+        for stock in g.filtered_stocks:
+            if check_buy_conditions(stock):
+                order_target(stock, 1000)  # 假设买入10000股
+                g.positions.append(stock)
+
+def check_buy_conditions(stock):
+    # 获取历史数据
+    history = get_history(20, '1d', ['close', 'volume'], [stock])
+    if history is None or history.empty:
+        return False
+    
+    # 检查历史数据是否足够
+    if len(history['close']) < 10:  # 至少需要 10 个数据点
+        return False
+    
+    # 计算技术指标
+    rsi6 = calculate_rsi(history['close'], 6)
+    macd = calculate_macd(history['close'])
+    boll = calculate_boll(history['close'])
+    
+    # 检查指标是否有效
+    if rsi6 is None or macd is None or boll is None:
+        return False
+    
+    # 获取最新指标值
+    try:
+        rsi6_value = rsi6.iloc[-1]  # 使用 iloc 避免 KeyError
+        macd_value = macd['macd'].iloc[-1]
+        macd_signal = macd['signal'].iloc[-1]
+        boll_close = boll['close'].iloc[-1]
+        boll_mid = boll['mid'].iloc[-1]
+        volume_ratio = history['volume'].iloc[-1] / history['volume'].mean()
+    except (IndexError, KeyError):  # 处理索引错误
+        return False
+    
+    # 检查买入条件
+    if (rsi6_value > g.buy_conditions['rsi6'] and
+        macd_value > macd_signal and
+        boll_close > boll_mid and
+        volume_ratio > g.buy_conditions['volume_ratio']):
+        return True
+    return False
+
+
+def check_sell_conditions(stock, positions):
+    if stock not in positions:
+        return False
+    # 获取当前持仓信息
+    position = positions[stock]
+    # 检查卖出条件
+    max_price = position['high']
+    current_price = position['price']
+    cost_price = position['cost_price']
+    if (current_price / max_price - 1 < -g.sell_conditions['max_drawdown'] or
+        current_price / cost_price - 1 < -g.sell_conditions['cost_drawdown']):
+        return True
+    return False
+
+def calculate_rsi(prices, period):
+    if len(prices) < period:
+        return None  # 数据不足，返回 None
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_macd(prices, short_window=12, long_window=26, signal_window=9):
+    if len(prices) < long_window:
+        return None  # 数据不足，返回 None
+    short_ema = prices.ewm(span=short_window, adjust=False).mean()
+    long_ema = prices.ewm(span=long_window, adjust=False).mean()
+    macd = short_ema - long_ema
+    signal = macd.ewm(span=signal_window, adjust=False).mean()
+    return {'macd': macd, 'signal': signal}
+
+def calculate_boll(prices, window=20):
+    if len(prices) < window:
+        return None  # 数据不足，返回 None
+    mid = prices.rolling(window=window).mean()
+    std = prices.rolling(window=window).std()
+    upper = mid + 2 * std
+    lower = mid - 2 * std
+    return {'mid': mid, 'upper': upper, 'lower': lower}
