@@ -6,8 +6,8 @@ def initialize(context):
     g.max_hold_num = 5
     # 买入条件参数
     g.buy_conditions = {
-        'rsi6': 50,
-        'volume_ratio': 2
+        'rsi6': 40,
+        'volume_ratio': 1.3
     }
     # 卖出条件参数
     g.sell_conditions = {
@@ -23,7 +23,7 @@ def initialize(context):
 
 
 def before_trading_start(context, data):
-    g.current_date = context.blotter.current_dt.strftime("%Y%m%d")
+    g.current_date = context.current_dt.strftime("%Y%m%d")
     # 获取全部A股
     g.security = get_Ashares(g.current_date)
     # 批量过滤ST股票（1次API调用，替代逐个循环5000+次）
@@ -70,27 +70,31 @@ def handle_data(context, data):
     if not stocks_to_check:
         return
 
-    # 批量获取历史数据（1次API调用，替代逐个循环5000+次）
+    # 批量获取历史数据
     try:
         history = get_history(g.history_bars, '1d', ['close', 'volume'], stocks_to_check)
-    except Exception:
+        print(f"[DEBUG] get_history成功, 股票数={len(stocks_to_check)}, type={type(history)}")
+    except Exception as e:
+        print(f"[DEBUG] get_history失败: {e}")
         return
 
+    debug_printed = False
     for stock in stocks_to_check:
         if len(candidates) >= need:
             break
 
         try:
-            # get_history 多股票返回 dict{code: DataFrame}
-            stock_df = history[stock]
-            closes = stock_df['close']
-            volumes = stock_df['volume']
+            stock_data = history[stock]
+            if isinstance(stock_data, dict):
+                closes = pd.Series(stock_data['close'])
+                volumes = pd.Series(stock_data['volume'])
+            else:
+                closes = stock_data['close']
+                volumes = stock_data['volume']
 
-            # 数据不足则跳过（MACD需要26根以上）
             if len(closes.dropna()) < 30:
                 continue
 
-            # 计算技术指标
             rsi6 = calculate_rsi(closes, 6)
             macd_result = calculate_macd(closes)
             boll = calculate_boll(closes)
@@ -106,15 +110,21 @@ def handle_data(context, data):
             avg_vol = volumes.mean()
             volume_ratio = volumes.iloc[-1] / avg_vol if avg_vol > 0 else 0
 
-            # 买入条件：RSI6>50 且 MACD>信号线 且 价格>布林中轨 且 放量2倍
+            if not debug_printed:
+                print(f"[DEBUG] {stock} rsi6={rsi6_value:.1f} macd={macd_value:.4f} signal={macd_signal:.4f} boll_close={boll_close:.2f} boll_mid={boll_mid:.2f} vol_ratio={volume_ratio:.2f}")
+                debug_printed = True
+
             if (rsi6_value > g.buy_conditions['rsi6'] and
                     macd_value > macd_signal and
                     boll_close > boll_mid and
                     volume_ratio > g.buy_conditions['volume_ratio']):
                 candidates.append(stock)
-        except Exception:
+        except Exception as e:
+            if stock == stocks_to_check[0]:
+                print(f"[DEBUG] {stock} 处理失败: {e}")
             continue
 
+    print(f"[DEBUG] 候选股票: {candidates}")
     # 执行买入
     for stock in candidates[:need]:
         order_target(stock, 1000)
