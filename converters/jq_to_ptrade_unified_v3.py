@@ -1712,14 +1712,6 @@ def _get_market_cap_ts(stock_list, date_str):
 
         return code
 
-            self.conversion_report['changes'].append(
-                "get_price分钟频率+high_limit: 拆分为分钟获取价格+日线获取涨跌停价"
-            )
-            return '\n'.join(result_lines)
-
-        code = pattern.sub(_split_minute_limit_fields, code)
-        return code
-
     def _convert_close_position(self, code: str) -> str:
         """v5.2: close_position(position) → close_position(stock)"""
         # close_position(position) where position = context.portfolio.positions[stock]
