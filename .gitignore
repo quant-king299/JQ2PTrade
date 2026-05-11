@@ -13,3 +13,12 @@ ptrade_local/data/
 
 # PTrade策略代码
 ptrade代码/
+
+# 聚宽策略源文件（仅本地参考）
+5四大搅屎棍策略.txt
+
+# API文档（仅本地参考）
+api_docs/
+
+# PTrade本地回测模块（仅本地使用）
+ptrade_local/

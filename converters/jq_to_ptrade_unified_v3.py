@@ -1,13 +1,36 @@
 """
-聚宽到Ptrade统一转换器 v3.10 (修复get_Ashares返回值处理)
+聚宽到Ptrade统一转换器 v5.2 (全面JQ→PTrade兼容)
 更新说明:
-- ✅ 修复get_Ashares().index.tolist()错误（改为list(get_Ashares())）
-- ✅ 证券代码后缀可选转换（默认不转换，Ptrade支持.XSHG/.XSHE）
-- ✅ 新增get_factor_values兼容函数（基于get_fundamentals封装）
-- ✅ 完善get_fundamentals转换（支持fields字符串/列表、is_dataframe）
-- ✅ 基于实际Ptrade Demo策略验证
-
-所有已知问题已修复！
+- ✅ v5.2: 反向集成四大搅屎棍策略调试发现的所有问题
+  - get_industry(): 改用tushare申万行业数据，PTrade代码格式(.SZ/.SS)
+  - get_stock_info(): 返回嵌套dict，start_date→listed_date+日期解析
+  - Position对象: 无.security属性，改用dict key
+  - Order对象: 返回字符串ID，不是Order对象
+  - get_fundamentals(): 无code列，股票代码是index；无market_cap字段
+  - get_market_value(): 回测不可用
+  - get_current_data_compat(): 使用真实涨跌停价格
+  - get_price(): 移除skip_paused/fq参数
+- ✅ v5.1: 修复query() ORM转换
+  - 使用括号计数法替代正则，正确匹配含嵌套括号的完整表达式
+  - 检测原始赋值变量，不再使用_query_result临时变量
+  - 先初始化结果变量，避免else块吞没后续代码
+  - 正保证留行缩进
+- ✅ v5.0: 反向集成PTrade运行调试发现的所有问题
+  - set_slippage(FixedSlippage(N)) → set_slippage(N)
+  - set_order_cost(OrderCost(...)) → 移除
+  - enable_profile() → 移除
+  - run_daily/run_weekly 位置参数格式修正
+  - get_price 移除 panel/fill_paused 参数
+  - get_price/get_index_stocks 日期 datetime.date → 字符串
+  - get_history JQ参数名转PTrade格式
+  - query() ORM自动转PTrade get_fundamentals
+  - indicator表映射到profit_ability
+  - .has_key() → in 操作符
+  - context.subportfolios[0] → context.portfolio
+  - get_current_data_compat() 无参调用修复
+  - h.time → h.index (get_price返回格式)
+- ✅ v4.0: 自动检测缺失的JQ函数，注入Tushare替代实现
+- ✅ v3.x: 基础API映射、datetime导入、辅助函数
 """
 import re
 import ast
@@ -39,7 +62,8 @@ class JQToPtradeUnifiedConverter:
     修复: get_Ashares返回值处理、get_factor_values兼容、完善get_fundamentals转换
     """
 
-    def __init__(self, verbose: bool = True, convert_security_codes: bool = False):
+    def __init__(self, verbose: bool = True, convert_security_codes: bool = False,
+                 tushare_token: str = ''):
         """
         初始化转换器
 
@@ -47,9 +71,11 @@ class JQToPtradeUnifiedConverter:
             verbose: 是否显示详细转换信息
             convert_security_codes: 是否转换证券代码后缀（.XSHG->.SS, .XSHE->.SZ）
                                      默认False，因为Ptrade向后兼容.XSHG/.XSHE格式
+            tushare_token: Tushare API token，用于注入数据函数
         """
         self.verbose = verbose
         self.convert_security_codes = convert_security_codes
+        self.tushare_token = tushare_token
         self.conversion_report = {
             'warnings': [],
             'errors': [],
@@ -93,13 +119,14 @@ class JQToPtradeUnifiedConverter:
             'get_Ashares': self._handle_get_Ashares,
         }
 
-        # 不支持的API
+        # 不支持的API（直接移除的）
         self.unsupported_apis = {
             'log.set_level',
             'set_commission',
             'set_price_limit',
             'set_order_cost',
-            'set_option',  # 添加set_option到不支持列表
+            'set_option',
+            'enable_profile',
         }
 
     def convert(self, jq_code: str, strategy_type: Optional[StrategyType] = None) -> str:
@@ -114,8 +141,8 @@ class JQToPtradeUnifiedConverter:
 
         if self.verbose:
             print("=" * 60)
-            print("聚宽到Ptrade统一转换器 v3.4 (修复datetime导入)")
-            print("智能添加辅助函数 + 精简注释 + 修复导入问题")
+            print("聚宽到Ptrade统一转换器 v5.1 (全面JQ→PTrade兼容)")
+            print("反向集成PTrade运行调试发现的所有问题")
             print("=" * 60)
 
         # 1. 分析代码
@@ -155,6 +182,7 @@ class JQToPtradeUnifiedConverter:
             'uses_factors': False,
             'uses_monthly_timing': False,
             'uses_current_data': False,
+            'needs_tushare_inject': [],  # 需要注入的 Tushare 函数
         }
 
         # 检测API使用
@@ -195,13 +223,34 @@ class JQToPtradeUnifiedConverter:
                     elif api_type == APIUsage.BASIC:
                         analysis['uses_historical_data'] = True
 
-        # 检测run_monthly使用
+        # 检测 run_monthly 使用
         if re.search(r'run_monthly\s*\(', code):
             analysis['uses_monthly_timing'] = True
 
         # 提取函数定义
         function_pattern = r'def\s+(\w+)\s*\([^)]*\)\s*:'
         analysis['functions'] = re.findall(function_pattern, code)
+
+        # ===== v4.0: 检测需要 Tushare 替代的 JQ 函数 =====
+        tushare_detect_patterns = {
+            'get_extras': r'\bget_extras\s*\(',
+            'get_concept_stocks': r'\bget_concept_stocks\s*\(',
+            'get_concepts': r'\bget_concepts\s*\(',
+            'get_industry': r'\bget_industry\s*\(',
+            'get_fundamentals_continuously': r'\bget_fundamentals_continuously\s*\(',
+            'get_factor_values': r'\bget_factor_values\s*\(',
+            'order_target_percent': r'\border_target_percent\s*\(',
+            'get_current_data': r'\bget_current_data\s*\(',
+            'check_limit_up': r'\bcheck_limit_up\s*\(',
+            'normalize_code': r'\bnormalize_code\s*\(',
+            'get_all_securities': r'\bget_all_securities\s*\(',
+        }
+        for func_name, pattern in tushare_detect_patterns.items():
+            # 排除策略文件中已自行定义的函数
+            func_defined = re.search(rf'^def\s+{func_name}\s*\(', code, re.MULTILINE)
+            func_called = re.search(pattern, code)
+            if func_called and not func_defined:
+                analysis['needs_tushare_inject'].append(func_name)
 
         return analysis
 
@@ -227,23 +276,21 @@ class JQToPtradeUnifiedConverter:
 
         # 2. 处理特殊API（注意：get_Ashares处理在API映射之后进行）
         for api_name, handler in self.special_apis.items():
-            # 跳过get_Ashares，在API映射之后再处理
             if api_name == 'get_Ashares':
                 continue
             if re.search(rf'{api_name}\s*\(', result):
                 result = handler(result, strategy_type)
-        # 3. 常规API映射（排除已经处理的定时任务API）
+
+        # 3. 常规API映射
         for jq_api, ptrade_api in self.api_mapping.items():
-            # 跳过定时任务API，已经在_convert_timing_functions中处理
             if jq_api in ['run_daily', 'run_weekly', 'run_monthly']:
                 continue
-
             pattern = rf'\b{re.escape(jq_api)}\b'
             if re.search(pattern, result):
                 result = re.sub(pattern, ptrade_api, result)
                 self.conversion_report['api_mappings'].append(f'{jq_api} → {ptrade_api}')
 
-        # 3.5. 处理get_Ashares的日期格式（必须在get_all_securities→get_Ashares映射之后）
+        # 3.5. 处理get_Ashares的日期格式
         result = self._handle_get_Ashares(result, strategy_type)
 
         # 4. 处理全局变量
@@ -252,14 +299,62 @@ class JQToPtradeUnifiedConverter:
         # 5. 标准化证券代码
         result = self._standardize_security_codes(result)
 
-        # 6. 移除不支持的API
+        # 6. 移除/转换不支持的API (v5.0: 增强处理)
         result = self._remove_unsupported_apis(result)
 
-        # 7. 转换技术指标
+        # 7. v5.0: 转换set_slippage(FixedSlippage(N)) → set_slippage(N)
+        result = self._convert_set_slippage(result)
+
+        # 8. v5.0: 转换JQ get_history参数名到PTrade格式
+        result = self._convert_get_history(result)
+
+        # 9. v5.0: 移除get_price的panel/fill_paused参数 + 修复日期格式
+        result = self._convert_get_price(result)
+
+        # 10. v5.0: 修复日期参数 (datetime.date → 字符串)
+        result = self._fix_date_args(result)
+
+        # 11. v5.0: 转换context.subportfolios[0] → context.portfolio
+        result = self._convert_subportfolios(result)
+
+        # 12. v5.0: 转换.has_key() → in
+        result = self._convert_has_key(result)
+
+        # 13. v5.0: 修复get_current_data_compat()无参调用
+        result = self._fix_get_current_data_calls(result)
+
+        # 14. v5.0: 转换query() ORM到PTrade get_fundamentals
+        result = self._convert_query_orm(result)
+
+        # 15. v5.0: 表名映射 indicator → profit_ability
+        result = self._map_table_names(result)
+
+        # 16. 转换技术指标
         result = self._convert_technical_indicators(result)
 
-        # 8. 转换其他杂项
+        # 17. 转换其他杂项
         result = self._convert_misc_issues(result)
+
+        # 18. v5.1: get_stock_info()返回dict，属性访问→字典访问
+        result = self._convert_stock_info_attr(result)
+
+        # 19. v5.2: Position对象没有.security属性
+        result = self._convert_position_access(result)
+
+        # 20. v5.2: Order返回字符串ID，不是对象
+        result = self._convert_order_checks(result)
+
+        # 21. v5.2: get_fundamentals返回DataFrame无code列
+        result = self._convert_get_fundamentals_code_field(result)
+
+        # 22. v5.2: get_market_value回测不可用
+        result = self._convert_market_value(result)
+
+        # 23. v5.2: 移除get_price不支持的参数
+        result = self._convert_get_price_params(result)
+
+        # 24. v5.2: close_position(position) → close_position(stock)
+        result = self._convert_close_position(result)
 
         return result
 
@@ -295,42 +390,58 @@ class JQToPtradeUnifiedConverter:
 
         # 添加get_current_data兼容函数（如果不存在）
         if 'def get_current_data_compat' not in code:
-            # 简化注释，保留必要信息
             compat_function = '''
 # get_current_data兼容函数 - 替代聚宽的get_current_data()
 def get_current_data_compat(security_list=None):
-    """模拟聚宽get_current_data()功能，使用get_price()实现"""
+    """模拟聚宽get_current_data()功能，使用get_history批量获取（PTrade兼容）"""
     import pandas as pd
 
-    try:
-        if security_list is None:
-            # 返回空字典，需要用户传入具体的security_list
-            # 或者可以从context.portfolio.positions获取
-            return {}
-
-        # 使用get_price获取最近一天的数据
-        df = get_price(security_list, count=1, fields=['close', 'high', 'low', 'volume', 'paused', 'name'])
-
-        # 构造返回数据，模拟聚宽的get_current_data()返回格式
-        result = {}
-        for stock in security_list:
-            if stock in df.index:
-                row = df.loc[stock]
-                # 估算涨跌停价格
-                close_price = row['close'] if 'close' in row else 0
-                result[stock] = type('obj', (), {
-                    'last_price': close_price,
-                    'high_limit': close_price * 1.1 if close_price > 0 else 0,  # 估算涨停价
-                    'low_limit': close_price * 0.9 if close_price > 0 else 0,   # 估算跌停价
-                    'paused': row.get('paused', False),                        # 停牌状态
-                    'is_st': 'ST' in stock or '*' in stock,                     # ST状态
-                    'name': row.get('name', stock),                             # 股票名称
-                })()
-
-        return result
-    except Exception as e:
-        # 出错时返回空字典
+    if security_list is None or not security_list:
         return {}
+
+    result = {}
+
+    # 批量获取收盘价和是否开盘
+    try:
+        df = get_history(1, '1d', ['close', 'is_open', 'high_limit', 'low_limit'], security_list=security_list, include=True, fill='nan')
+
+        if df is not None and not df.empty and 'code' in df.columns:
+            for code, group in df.groupby('code'):
+                try:
+                    close_price = float(group['close'].iloc[-1])
+                    is_open = float(group['is_open'].iloc[-1]) if 'is_open' in group.columns else 1
+                    high_limit = float(group['high_limit'].iloc[-1]) if 'high_limit' in group.columns else 0
+                    low_limit = float(group['low_limit'].iloc[-1]) if 'low_limit' in group.columns else 0
+                except Exception:
+                    close_price = 0
+                    is_open = 1
+                    high_limit = 0
+                    low_limit = 0
+
+                result[code] = type('obj', (), {
+                    'last_price': close_price,
+                    'high_limit': high_limit if high_limit > 0 else round(close_price * 1.1, 2),
+                    'low_limit': low_limit if low_limit > 0 else round(close_price * 0.9, 2),
+                    'paused': (is_open == 0),
+                    'is_st': False,
+                    'name': code,
+                })()
+    except Exception:
+        pass
+
+    # 对没获取到数据的股票，补充默认值（确保不返回空dict）
+    for stock in security_list:
+        if stock not in result:
+            result[stock] = type('obj', (), {
+                'last_price': 0,
+                'high_limit': 0,
+                'low_limit': 0,
+                'paused': False,
+                'is_st': False,
+                'name': stock,
+            })()
+
+    return result
 
 # ========================================
 
@@ -778,6 +889,7 @@ def get_factor_values(stock_list, factor, end_date=None, count=1, **kwargs):
         - 不支持 run_weekly() 和 run_monthly()
         - 必须将所有定时函数转换为run_daily()
         - 在函数内部添加日期检查逻辑
+        - JQ支持位置参数: run_weekly(func, 1, '9:30') 和关键字参数: run_weekly(func, weekday=1, time='9:30')
         """
 
         # 收集需要特殊处理的函数（用于添加日期检查）
@@ -786,60 +898,85 @@ def get_factor_values(stock_list, factor, end_date=None, count=1, **kwargs):
 
         # 处理run_weekly - 转换为run_daily
         def replace_run_weekly(match):
-            func_name = match.group(1)
+            func_name = match.group(1).strip()
             weekday = match.group(2) if match.group(2) else '1'
-            time_str = match.group(3) if match.group(3) else "'09:30'"
+            time_str = match.group(3).strip() if match.group(3) else "'09:30'"
 
-            # 记录需要添加星期检查的函数
+            # 如果time_str没有引号，加上引号
+            if time_str and not time_str.startswith("'") and not time_str.startswith('"'):
+                time_str = f"'{time_str}'"
+
             weekly_functions.append({'name': func_name, 'weekday': weekday})
-
-            # 转换为run_daily
             return f'run_daily(context, {func_name}, time={time_str})'
 
-        run_weekly_pattern = r'run_weekly\s*\(\s*([^,]+),\s*weekday\s*=\s*(\d+)(?:,\s*time\s*=\s*([^,\)]+))?(?:,\s*reference_security\s*=\s*[^)]+)?\s*\)'
+        # 同时匹配关键字参数和位置参数格式
+        run_weekly_patterns = [
+            # 关键字参数: run_weekly(func, weekday=1, time='9:30')
+            r'run_weekly\s*\(\s*([^,]+),\s*weekday\s*=\s*(\d+)(?:,\s*time\s*=\s*([^,\)]+))?(?:,\s*reference_security\s*=\s*[^)]+)?\s*\)',
+            # 位置参数: run_weekly(func, 1, '9:30')
+            r"run_weekly\s*\(\s*([^,]+)\s*,\s*(\d+)\s*(?:,\s*(['\"][^'\"]*['\"]|[^\)]+?))?\s*\)",
+        ]
 
-        if re.search(run_weekly_pattern, code):
-            code = re.sub(run_weekly_pattern, replace_run_weekly, code)
-            self.conversion_report['changes'].append(
-                "run_weekly → run_daily (需要在函数内检查weekday)"
-            )
+        for pattern in run_weekly_patterns:
+            if re.search(pattern, code):
+                code = re.sub(pattern, replace_run_weekly, code)
+                self.conversion_report['changes'].append(
+                    "run_weekly → run_daily (需要在函数内检查weekday)"
+                )
+                break
 
         # 处理run_monthly - 转换为run_daily
         def replace_run_monthly(match):
             func_name = match.group(1).strip() if match.group(1) else ""
             monthday = match.group(2) if match.group(2) else "1"
-            time_str = match.group(3) if match.group(3) else "'09:30'"
+            time_str = match.group(3).strip() if match.group(3) else "'09:30'"
 
-            # 记录需要添加月份检查的函数
+            if time_str and not time_str.startswith("'") and not time_str.startswith('"'):
+                time_str = f"'{time_str}'"
+
             if func_name:
                 monthly_functions.append({'name': func_name, 'day': monthday})
-
-            # 转换为run_daily
             return f'run_daily(context, {func_name}, time={time_str})'
 
-        run_monthly_pattern = r'run_monthly\s*\(\s*([^,\s]+)\s*(?:,\s*monthday\s*=\s*(\d+))?(?:,\s*time\s*=\s*([^,\)]+))?(?:,\s*reference_security\s*=\s*[^)]+)?\s*\)'
+        run_monthly_patterns = [
+            # 关键字参数: run_monthly(func, monthday=1, time='9:30')
+            r'run_monthly\s*\(\s*([^,\s]+)\s*(?:,\s*monthday\s*=\s*(\d+))?(?:,\s*time\s*=\s*([^,\)]+))?(?:,\s*reference_security\s*=\s*[^)]+)?\s*\)',
+            # 位置参数: run_monthly(func, 1, '9:30')
+            r"run_monthly\s*\(\s*([^,\s]+)\s*(?:,\s*(\d+)\s*)?(?:,\s*(['\"][^'\"]*['\"]|[^\)]+?))?\s*\)",
+        ]
 
-        if re.search(run_monthly_pattern, code):
-            code = re.sub(run_monthly_pattern, replace_run_monthly, code)
-            self.conversion_report['changes'].append(
-                "run_monthly → run_daily (需要在函数内检查day of month)"
-            )
+        for pattern in run_monthly_patterns:
+            if re.search(pattern, code):
+                code = re.sub(pattern, replace_run_monthly, code)
+                self.conversion_report['changes'].append(
+                    "run_monthly → run_daily (需要在函数内检查day of month)"
+                )
+                break
 
         # 处理run_daily - 添加context参数
         def replace_run_daily(match):
-            func_name = match.group(1)
-            time_str = match.group(2) if match.group(2) else "'9:30'"
+            func_name = match.group(1).strip()
+            time_str = match.group(2).strip() if match.group(2) else "'9:30'"
 
-            # 添加context作为第一个参数
+            if time_str and not time_str.startswith("'") and not time_str.startswith('"'):
+                time_str = f"'{time_str}'"
+
             return f'run_daily(context, {func_name}, time={time_str})'
 
-        run_daily_pattern = r'run_daily\s*\(\s*([^,\s]+)\s*(?:,\s*time\s*=\s*([^,\)]+))?(?:,\s*reference_security\s*=\s*[^)]+)?\s*\)'
+        run_daily_patterns = [
+            # 关键字参数: run_daily(func, time='9:05') — 跳过已有context的已转换调用
+            r"run_daily\s*\(\s*(?!context\b)([^,\s]+)\s*(?:,\s*time\s*=\s*([^,\)]+))?(?:,\s*reference_security\s*=\s*[^)]+)?\s*\)",
+            # 位置参数: run_daily(func, '9:05') — 跳过已有context的已转换调用
+            r"run_daily\s*\(\s*(?!context\b)([^,\s]+)\s*,\s*(['\"][^'\"]*['\"]|[^\)]+?)\s*\)",
+        ]
 
-        if re.search(run_daily_pattern, code):
-            code = re.sub(run_daily_pattern, replace_run_daily, code)
-            self.conversion_report['changes'].append(
-                "run_daily - 添加context参数，移除reference_security"
-            )
+        for pattern in run_daily_patterns:
+            if re.search(pattern, code):
+                code = re.sub(pattern, replace_run_daily, code)
+                self.conversion_report['changes'].append(
+                    "run_daily - 添加context参数，移除reference_security"
+                )
+                break
 
         # 为需要星期/月份检查的函数添加检查逻辑
         code = self._add_timing_checks(code, weekly_functions, monthly_functions)
@@ -924,14 +1061,16 @@ def get_factor_values(stock_list, factor, end_date=None, count=1, **kwargs):
         return code
 
     def _remove_unsupported_apis(self, code: str) -> str:
-        """移除不支持的API"""
+        """移除不支持的API（支持多行参数）"""
         for api in self.unsupported_apis:
-            pattern = rf'{re.escape(api)}\s*\([^)]*\)\s*(?=#|\n|$)'
-            if re.search(pattern, code):
+            # 匹配单行和多行的API调用
+            pattern = rf'{re.escape(api)}\s*\(.*?\)\s*(?=\n|$)'
+            if re.search(pattern, code, re.DOTALL):
                 code = re.sub(
                     pattern,
-                    f'# [已移除] {api}()  # Ptrade不支持此API\n',
-                    code
+                    f'# [已移除] {api}()  # PTrade不支持此API',
+                    code,
+                    flags=re.DOTALL
                 )
                 self.conversion_report['warnings'].append(f'已移除不支持的API: {api}')
 
@@ -984,15 +1123,525 @@ def get_factor_values(stock_list, factor, end_date=None, count=1, **kwargs):
 
         return code
 
-    def _convert_misc_issues(self, code: str) -> str:
-        """转换其他杂项问题"""
-        # 处理OrderStatus - Ptrade可能使用不同的常量名
-        code = re.sub(
-            r'\bOrderStatus\.held\b',
-            "'held'",  # 使用字符串常量
+    # ========================================================================
+    # v5.0 新增转换方法
+    # ========================================================================
+
+    def _convert_set_slippage(self, code: str) -> str:
+        """转换 set_slippage(FixedSlippage(N)) → set_slippage(N)"""
+        # set_slippage(FixedSlippage(0)) → set_slippage(0)
+        new_code = re.sub(
+            r'set_slippage\s*\(\s*FixedSlippage\s*\(\s*([^)]+)\s*\)\s*\)',
+            r'set_slippage(\1)',
+            code
+        )
+        if new_code != code:
+            self.conversion_report['changes'].append(
+                "set_slippage(FixedSlippage(N)) → set_slippage(N) (PTrade期望数字)"
+            )
+        return new_code
+
+    def _convert_get_history(self, code: str) -> str:
+        """转换JQ get_history/history参数名到PTrade格式
+
+        只做关键字参数名替换，不重构调用结构：
+        - unit → frequency
+        - end_dt → end_date
+        - include_now → include
+        - df → 移除
+        """
+        changes = []
+
+        # unit= → frequency= (只替换get_history调用内的)
+        if re.search(r'get_history\s*\(', code) and 'unit=' in code:
+            new = re.sub(r'(get_history\s*\([^)]*?)unit=', r'\1frequency=', code)
+            if new != code:
+                code = new
+                changes.append('unit → frequency')
+
+        # end_dt= → end_date=
+        if re.search(r'get_history\s*\(', code) and 'end_dt=' in code:
+            new = re.sub(r'(get_history\s*\([^)]*?)end_dt=', r'\1end_date=', code)
+            if new != code:
+                code = new
+                changes.append('end_dt → end_date')
+
+        # include_now= → include=
+        if re.search(r'get_history\s*\(', code) and 'include_now=' in code:
+            new = re.sub(r'(get_history\s*\([^)]*?)include_now=', r'\1include=', code)
+            if new != code:
+                code = new
+                changes.append('include_now → include')
+
+        # 移除 df=True/False 参数
+        if re.search(r'get_history\s*\(', code) and 'df=' in code:
+            new = re.sub(r',\s*df\s*=\s*(True|False)', '', code)
+            if new != code:
+                code = new
+                changes.append('移除df参数')
+
+        if changes:
+            self.conversion_report['changes'].append(
+                f"get_history JQ参数名转PTrade格式 ({', '.join(changes)})"
+            )
+        return code
+
+    def _convert_get_price(self, code: str) -> str:
+        """移除get_price的panel/fill_paused参数，修复日期格式"""
+        # 移除 panel=False/True
+        new_code = re.sub(r',\s*panel\s*=\s*(?:False|True)', '', code)
+        # 移除 fill_paused=False/True
+        new_code = re.sub(r',\s*fill_paused\s*=\s*(?:False|True)', '', new_code)
+
+        # 修复 get_price 返回格式: h['date'] = pd.DatetimeIndex(h.time).date → h['date'] = h.index.date
+        new_code = re.sub(
+            r"h\['date'\]\s*=\s*pd\.DatetimeIndex\(h\.time\)\.date",
+            "if 'time' in h.columns:\n        h['date'] = pd.DatetimeIndex(h.time).date\n    else:\n        h['date'] = h.index.date",
+            new_code
+        )
+
+        if new_code != code:
+            self.conversion_report['changes'].append(
+                "get_price: 移除panel/fill_paused参数，兼容返回格式"
+            )
+        return new_code
+
+    def _fix_date_args(self, code: str) -> str:
+        """修复日期参数: datetime.date对象 → 字符串格式
+
+        PTrade的get_price/get_index_stocks等要求字符串日期，不接受datetime.date
+        """
+        changes = 0
+
+        # get_index_stocks(code, date_obj) → get_index_stocks(code, date_obj.strftime('%Y%m%d'))
+        # 匹配第二个参数是变量名(非字符串)的情况
+        new_code = re.sub(
+            r"(get_index_stocks\s*\(\s*['\"][^'\"]+['\"](?:\.(?:XSHG|XSHE|SS|SZ))?\s*,\s*)(\w+(?:\.\w+)*)\s*\)",
+            lambda m: f"{m.group(1)}{m.group(2)}.strftime('%Y%m%d'))" if '.strftime' not in m.group(2) else m.group(0),
+            code
+        )
+        if new_code != code:
+            changes += 1
+
+        # get_price(..., end_date=context.previous_date, ...) → .strftime('%Y%m%d')
+        # 只对 context.previous_date 和 yesterday 变量添加转换
+        for date_var in ['context.previous_date', 'yesterday']:
+            pattern = rf"(end_date\s*=\s*{re.escape(date_var)})(\s*[,)])"
+            replacement = rf"end_date={date_var}.strftime('%Y%m%d')\2"
+            new_code2 = re.sub(pattern, replacement, new_code)
+            if new_code2 != new_code:
+                new_code = new_code2
+                changes += 1
+
+        if changes > 0:
+            self.conversion_report['changes'].append(
+                "日期参数: datetime.date → .strftime('%Y%m%d') (PTrade要求字符串)"
+            )
+        return new_code
+
+    def _convert_subportfolios(self, code: str) -> str:
+        """转换 context.subportfolios[0] → context.portfolio"""
+        new_code = code.replace('context.subportfolios[0].long_positions', 'context.portfolio.positions')
+        new_code = new_code.replace('context.subportfolios[0].available_cash', 'context.portfolio.available_cash')
+        new_code = new_code.replace('context.subportfolios[0]', 'context.portfolio')
+
+        if new_code != code:
+            self.conversion_report['changes'].append(
+                "context.subportfolios[0] → context.portfolio (PTrade无subportfolios)"
+            )
+        return new_code
+
+    def _convert_has_key(self, code: str) -> str:
+        """转换 Python 2 的 .has_key() → in 操作符"""
+        # dict.has_key(key) → key in dict
+        new_code = re.sub(
+            r'(\w+)\.has_key\s*\(\s*([^)]+)\s*\)',
+            r'\2 in \1',
+            code
+        )
+        if new_code != code:
+            self.conversion_report['changes'].append(
+                ".has_key() → in 操作符 (Python 3兼容)"
+            )
+        return new_code
+
+    def _fix_get_current_data_calls(self, code: str) -> str:
+        """修复 get_current_data_compat() 无参调用
+
+        在过滤函数中: current_data = get_current_data_compat()
+        需要: current_data = get_current_data_compat(stock_list)
+        """
+        # 在函数定义中找到模式: def filter_xxx(stock_list): ... get_current_data_compat()
+        # 替换为: get_current_data_compat(stock_list)
+        new_code = re.sub(
+            r'get_current_data_compat\s*\(\s*\)',
+            'get_current_data_compat(stock_list)',
             code
         )
 
+        if new_code != code:
+            self.conversion_report['changes'].append(
+                "get_current_data_compat() → get_current_data_compat(stock_list) (修复无参调用)"
+            )
+        return new_code
+
+    def _find_matching_paren(self, text, open_pos):
+        """从open_pos位置的(开始，用括号计数找到匹配的)的位置"""
+        depth = 0
+        for i in range(open_pos, len(text)):
+            if text[i] == '(':
+                depth += 1
+            elif text[i] == ')':
+                depth -= 1
+                if depth == 0:
+                    return i
+        return -1
+
+    def _convert_query_orm(self, code: str) -> str:
+        """转换JQ query() ORM到PTrade get_fundamentals
+
+        使用括号计数法正确匹配含嵌套括号的完整表达式:
+        get_fundamentals(query(...).filter(...).order_by(...).limit(N)).set_index('code').index.tolist()
+        """
+        changed = False
+        max_iterations = 10  # 防止无限循环
+
+        for _ in range(max_iterations):
+            start_match = re.search(r'get_fundamentals\s*\(\s*query\s*\(', code)
+            if not start_match:
+                break
+
+            start_idx = start_match.start()
+            gf_open = code.index('(', start_idx)
+
+            # 括号计数找 get_fundamentals( 的匹配 )
+            gf_close = self._find_matching_paren(code, gf_open)
+            if gf_close == -1:
+                break
+
+            # 检查尾部 .set_index('code').index.tolist() 等
+            rest = code[gf_close + 1:]
+            trail_len = 0
+            for tp in [
+                r"\.set_index\([^)]*\)\s*\.\s*index\s*\.\s*tolist\s*\(\s*\)",
+                r"\.set_index\([^)]*\)\s*\.\s*index\b",
+            ]:
+                tm = re.match(tp, rest)
+                if tm:
+                    trail_len = tm.end()
+                    break
+
+            full_end = gf_close + 1 + trail_len
+
+            # 检测缩进和赋值变量
+            line_start = code.rfind('\n', 0, start_idx) + 1
+            # 只提取行首空白，不含变量名
+            ind = ''
+            for c in code[line_start:]:
+                if c in ' \t':
+                    ind += c
+                else:
+                    break
+            if not ind:
+                ind = '    '
+
+            # 向前找 "var = " 模式
+            prefix = code[:start_idx]
+            assign_match = re.search(r'(\w[\w.]*)\s*=\s*$', prefix)
+            if assign_match:
+                result_var = assign_match.group(1)
+            else:
+                result_var = '_query_result'
+            replace_start = line_start
+
+            # 提取 get_fundamentals(...) 内部文本
+            inner = code[gf_open + 1:gf_close]
+
+            # 解析 query(...) 内容（括号计数）
+            q_match = re.search(r'query\s*\(', inner)
+            if not q_match:
+                break
+            q_open = inner.index('(', q_match.start())
+            q_close = self._find_matching_paren(inner, q_open)
+            if q_close == -1:
+                break
+
+            query_fields = inner[q_open + 1:q_close].strip()
+            fields = re.findall(r'(\w+)\.(\w+)', query_fields)
+            if not fields:
+                break
+
+            main_table = fields[0][0]
+            field_names = [f[1] for f in fields]
+
+            # 解析 .filter(...)（括号计数）
+            remaining = inner[q_close + 1:]
+            filter_content = ''
+            fm = re.search(r'\.filter\s*\(', remaining)
+            if fm:
+                f_open_abs = q_close + 1 + fm.end() - 1
+                f_close = self._find_matching_paren(inner, f_open_abs)
+                if f_close != -1:
+                    filter_content = inner[f_open_abs + 1:f_close].strip()
+                    remaining = inner[f_close + 1:]
+
+            # 解析 .order_by(...)
+            order_content = ''
+            om = re.search(r'\.order_by\s*\(', remaining)
+            if om:
+                o_open = om.end() - 1
+                o_close = self._find_matching_paren(remaining, o_open)
+                if o_close != -1:
+                    order_content = remaining[o_open + 1:o_close].strip()
+                    remaining = remaining[o_close + 1:]
+
+            # 解析 .limit(...)
+            limit_val = 'None'
+            lm = re.search(r'\.limit\s*\(', remaining)
+            if lm:
+                l_open = lm.end() - 1
+                l_close = self._find_matching_paren(remaining, l_open)
+                if l_close != -1:
+                    limit_val = remaining[l_open + 1:l_close].strip()
+
+            # 解析 filter 条件
+            stock_var = None
+            filter_conditions = []
+            for cond in re.finditer(r'(\w+)\.(\w+)\s*>\s*([\d.]+)', filter_content):
+                filter_conditions.append((cond.group(1), cond.group(2), '>', cond.group(3)))
+            for cond in re.finditer(r'(\w+)\.(\w+)\s*<\s*([\d.]+)', filter_content):
+                filter_conditions.append((cond.group(1), cond.group(2), '<', cond.group(3)))
+            in_match = re.search(r'(\w+)\.code\.in_\s*\(\s*([\w.]+)\s*\)', filter_content)
+            if in_match:
+                stock_var = in_match.group(2)
+            if not stock_var:
+                stock_var = 'security'
+
+            # 解析 order_by
+            is_asc = True
+            order_field = None
+            if order_content:
+                om2 = re.search(r'(\w+)\.(\w+)\.(asc|desc)', order_content)
+                if om2:
+                    order_field = om2.group(2)
+                    is_asc = om2.group(3) == 'asc'
+
+            # 生成替换代码（先初始化变量，只用if不用else，避免吞没后续代码）
+            date_arg = "yesterday.strftime('%Y%m%d') if 'yesterday' in dir() else context.previous_date.strftime('%Y%m%d')"
+
+            lines = []
+            lines.append(f"{ind}# JQ query自动转换")
+
+            # 跨表filter先查
+            main_conditions = []
+            cross_conditions = []
+            if filter_conditions:
+                main_conditions = [(t, f, o, v) for t, f, o, v in filter_conditions if t == main_table]
+                cross_conditions = [(t, f, o, v) for t, f, o, v in filter_conditions if t != main_table]
+
+                for tbl, fld, op, val in cross_conditions:
+                    ptbl = 'profit_ability' if tbl == 'indicator' else tbl
+                    lines.append(f"{ind}df_{tbl} = get_fundamentals({stock_var}, '{ptbl}', fields=['code', '{fld}'],")
+                    lines.append(f"{ind}              date={date_arg}, is_dataframe=True)")
+                    lines.append(f"{ind}if df_{tbl} is not None and not df_{tbl}.empty and 'code' in df_{tbl}.columns:")
+                    lines.append(f"{ind}    {stock_var} = df_{tbl}[df_{tbl}['{fld}'] {op} {val}]['code'].tolist()")
+                    lines.append(f"{ind}else:")
+                    lines.append(f"{ind}    {stock_var} = []")
+
+            # 主表查询
+            lines.append(f"{ind}{result_var} = []")
+            all_fields = ['code'] + field_names
+            if order_field and order_field not in all_fields:
+                all_fields.append(order_field)
+            fields_str = str(all_fields)
+            lines.append(f"{ind}df_query = get_fundamentals({stock_var}, '{main_table}', fields={fields_str},")
+            lines.append(f"{ind}              date={date_arg}, is_dataframe=True)")
+            lines.append(f"{ind}if df_query is not None and not df_query.empty:")
+
+            for tbl, fld, op, val in main_conditions:
+                lines.append(f"{ind}    df_query = df_query[df_query['{fld}'] {op} {val}]")
+
+            if order_field:
+                direction = 'True' if is_asc else 'False'
+                lines.append(f"{ind}    df_query = df_query.sort_values('{order_field}', ascending={direction})")
+            if limit_val and limit_val != 'None':
+                lines.append(f"{ind}    df_query = df_query.head({limit_val})")
+
+            lines.append(f"{ind}    {result_var} = df_query.set_index('code').index.tolist() if 'code' in df_query.columns else []")
+
+            replacement = '\n'.join(lines)
+            new_code = code[:replace_start] + replacement + code[full_end:]
+
+            if new_code != code:
+                changed = True
+                code = new_code
+            else:
+                break
+
+        if changed:
+            self.conversion_report['changes'].append(
+                f"query() ORM自动转PTrade get_fundamentals (table={main_table})"
+            )
+        return code
+
+    def _map_table_names(self, code: str) -> str:
+        """映射JQ表名到PTrade表名: indicator → profit_ability"""
+        mappings = {
+            "'indicator'": "'profit_ability'",
+            '"indicator"': "'profit_ability'",
+        }
+        new_code = code
+        for old, new in mappings.items():
+            new_code = new_code.replace(old, new)
+        if new_code != code:
+            self.conversion_report['changes'].append(
+                "表名映射: indicator → profit_ability"
+            )
+        return new_code
+
+    def _convert_misc_issues(self, code: str) -> str:
+        """转换其他杂项问题"""
+        # 处理OrderStatus
+        code = re.sub(
+            r'\bOrderStatus\.held\b',
+            "'held'",
+            code
+        )
+        # 移除 from jqdata import *
+        code = re.sub(r'from\s+jqdata\s+import\s+\*\s*\n?', '', code)
+        # 移除 import jqdata
+        code = re.sub(r'import\s+jqdata\s*\n?', '', code)
+        # 移除 from jqfactor import *
+        code = re.sub(r'from\s+jqfactor\s+import\s+\*\s*\n?', '', code)
+
+        return code
+
+    def _convert_stock_info_attr(self, code: str) -> str:
+        """v5.1: get_stock_info()返回嵌套dict，属性访问→字典访问+日期解析"""
+        # get_stock_info(x).start_date → 解析listed_date
+        pattern = r'get_stock_info\(([^)]+)\)\s*\.\s*start_date'
+        if re.search(pattern, code):
+            def replace_stock_info(m):
+                var = m.group(1).strip()
+                return f"datetime.datetime.strptime(get_stock_info({var}).get({var}, {{}}).get('listed_date', '2000-01-01'), '%Y-%m-%d').date()"
+            code = re.sub(pattern, replace_stock_info, code)
+            self.conversion_report['api_mappings'].append('get_stock_info(x).start_date → get_stock_info(x)[x]["listed_date"]')
+        return code
+
+    def _convert_position_access(self, code: str) -> str:
+        """v5.2: position.security不存在，改用dict key"""
+        # position.security → 直接在调用处改为用stock变量
+        # 处理: for position in ...: stock = position.security
+        code = re.sub(
+            r'for\s+position\s+in\s+list\(context\.portfolio\.positions\.values\(\)\):\s*\n\s*stock\s*=\s*position\.security\s*\n\s*context\.hold_list\.append\(stock\)',
+            'context.hold_list = list(context.portfolio.positions.keys())',
+            code
+        )
+        # 处理: stock = position.security
+        code = re.sub(r'stock\s*=\s*position\.security', '# stock already from dict key', code)
+        return code
+
+    def _convert_order_checks(self, code: str) -> str:
+        """v5.2: PTrade order返回字符串ID，不是Order对象"""
+        # order.filled > 0 → order is not None and order != ''
+        code = re.sub(
+            r'order\s*!=\s*None\s+and\s+order\.filled\s*>\s*0',
+            "order is not None and order != ''",
+            code
+        )
+        # order.status == 'held' and order.filled == order.amount → True
+        code = re.sub(
+            r"order\.status\s*==\s*'held'\s+and\s+order\.filled\s*==\s*order\.amount",
+            "True",
+            code
+        )
+        # order != None (general)
+        code = re.sub(r'order\s*!=\s*None\b', "order is not None and order != ''", code)
+        return code
+
+    def _convert_get_fundamentals_code_field(self, code: str) -> str:
+        """v5.2: PTrade get_fundamentals返回的DataFrame无code列，股票代码是index"""
+        # 移除fields参数中的'code'
+        code = re.sub(
+            r"fields\s*=\s*\['code',\s*",
+            "fields=['",
+            code
+        )
+        code = re.sub(
+            r",\s*'code'\]",
+            "]",
+            code
+        )
+        code = re.sub(
+            r"\['code',\s*'code',\s*",
+            "['",
+            code
+        )
+        # df['code'].tolist() → df.index.tolist()
+        code = re.sub(r"df_\w+\['code'\]\.tolist\(\)", lambda m: m.group(0).replace("['code']", ".index"), code)
+        # df.set_index('code').index.tolist() → df.index.tolist()
+        code = re.sub(r"\.set_index\('code'\)\.index\.tolist\(\)", ".index.tolist()", code)
+        # 'code' in df.columns → 永远False，删除这个条件
+        code = re.sub(r"and\s+'code'\s+in\s+\w+\.columns", "", code)
+        return code
+
+    def _convert_market_value(self, code: str) -> str:
+        """v5.2: get_market_value回测不可用，替换为tushare daily_basic"""
+        if 'get_market_value' not in code:
+            return code
+        # 添加tushare市值获取辅助函数（如果不存在）
+        if 'def _get_market_cap_ts' not in code:
+            helper = '''
+
+def _get_market_cap_ts(stock_list, date_str):
+    """通过tushare获取市值数据（PTrade回测模式兼容）"""
+    try:
+        ts_codes = []
+        for s in stock_list:
+            code, suffix = s.split('.')
+            ts_codes.append(code + ('.SH' if suffix == '.SS' else '.' + suffix))
+        df = _ts_pro.daily_basic(trade_date=date_str, fields='ts_code,total_mv')
+        if df is not None and not df.empty:
+            ts_set = set(ts_codes)
+            df = df[df['ts_code'].isin(ts_set)]
+            result = {}
+            for _, row in df.iterrows():
+                ts_c = row['ts_code']
+                code, suffix = ts_c.split('.')
+                ptrade_code = code + ('.SS' if suffix == 'SH' else '.' + suffix)
+                result[ptrade_code] = row['total_mv']
+            return result
+    except Exception:
+        pass
+    return {}
+
+'''
+            lines = code.split('\n')
+            insert_idx = 0
+            for i, line in enumerate(lines):
+                if line.startswith('def '):
+                    insert_idx = i
+                    break
+            lines.insert(insert_idx, helper)
+            code = '\n'.join(lines)
+        return code
+
+    def _convert_get_price_params(self, code: str) -> str:
+        """v5.2: 移除get_price不支持的skip_paused/fq参数"""
+        # skip_paused=False
+        code = re.sub(r',\s*skip_paused\s*=\s*\w+', '', code)
+        # fq='pre' or fq='daily'
+        code = re.sub(r",\s*fq\s*=\s*['\"][^'\"]*['\"]", '', code)
+        return code
+
+    def _convert_close_position(self, code: str) -> str:
+        """v5.2: close_position(position) → close_position(stock)"""
+        # close_position(position) where position = context.portfolio.positions[stock]
+        code = re.sub(
+            r'position\s*=\s*context\.portfolio\.positions\[stock\]\s*\n(\s*)close_position\(position\)',
+            r'\1close_position(stock)',
+            code
+        )
         return code
 
     def _add_helper_functions(self, code: str, analysis: Dict) -> str:
@@ -1006,10 +1655,6 @@ def get_factor_values(stock_list, factor, end_date=None, count=1, **kwargs):
         has_macd_func = 'def get_macd_value' in code
         has_rsi_func = 'def get_rsi_value' in code
         has_compat_func = 'def get_current_data_compat' in code
-
-        # 只有在代码中实际使用且没有定义时才添加
-        if not (uses_macd or uses_rsi or has_get_current_data):
-            return code
 
         helper_functions = []
         added_funcs = []
@@ -1108,6 +1753,53 @@ def get_rsi_value(context, security, period=14):
 
             self.conversion_report['added_functions'].extend(added_funcs)
 
+        # ===== v4.0: 注入 Tushare 数据函数 =====
+        tushare_funcs = analysis.get('needs_tushare_inject', [])
+        if tushare_funcs:
+            code = self._inject_tushare_functions(code, tushare_funcs)
+
+        return code
+
+    def _inject_tushare_functions(self, code: str, required_functions: list) -> str:
+        """注入 Tushare 数据函数到策略代码中"""
+        try:
+            from .tushare_data_functions import get_injection_code
+        except ImportError:
+            from tushare_data_functions import get_injection_code
+
+        # 获取 Tushare token
+        token = self.tushare_token
+        if not token:
+            try:
+                import sys
+                from pathlib import Path
+                project_root = Path(__file__).resolve().parent.parent.parent
+                sys.path.insert(0, str(project_root))
+                from config import get_env_config
+                env = get_env_config()
+                token = env.tushare_token or ''
+            except Exception:
+                pass
+
+        injection_code = get_injection_code(required_functions, tushare_token=token)
+        if not injection_code:
+            return code
+
+        # 找到第一个 def 或 initialize 函数，在其前面插入
+        lines = code.split('\n')
+        insert_index = 0
+        for i, line in enumerate(lines):
+            if line.startswith('def ') or (line.strip() and not line.startswith('#') and not line.startswith('import')):
+                insert_index = i
+                break
+
+        lines.insert(insert_index, injection_code + '\n')
+        code = '\n'.join(lines)
+
+        self.conversion_report['added_functions'].extend(required_functions)
+        if self.verbose:
+            print(f"\n[Tushare] 注入数据函数: {', '.join(required_functions)}")
+
         return code
 
     def _post_process(self, code: str, strategy_type: StrategyType) -> str:
@@ -1149,7 +1841,7 @@ def get_rsi_value(context, security, period=14):
         # 添加头部说明
         header = f'''# 聚宽策略转Ptrade - {strategy_type.value.upper()}版本
 # 转换时间: {self._get_timestamp()}
-# 转换器版本: v3.4 - 修复datetime导入，智能添加辅助函数
+# 转换器版本: v5.2 - 反向集成PTrade回测调试修复
 
 '''
 
