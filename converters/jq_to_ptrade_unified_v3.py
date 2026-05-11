@@ -1224,8 +1224,8 @@ def get_factor_values(stock_list, factor, end_date=None, count=1, **kwargs):
             changes += 1
 
         # get_price(..., end_date=context.previous_date, ...) → .strftime('%Y%m%d')
-        # 只对 context.previous_date 和 yesterday 变量添加转换
-        for date_var in ['context.previous_date', 'yesterday']:
+        # 只对 context.previous_date、yesterday 和 now_time 变量添加转换
+        for date_var in ['context.previous_date', 'yesterday', 'now_time', 'context.current_dt']:
             pattern = rf"(end_date\s*=\s*{re.escape(date_var)})(\s*[,)])"
             replacement = rf"end_date={date_var}.strftime('%Y%m%d')\2"
             new_code2 = re.sub(pattern, replacement, new_code)
@@ -1627,11 +1627,97 @@ def _get_market_cap_ts(stock_list, date_str):
         return code
 
     def _convert_get_price_params(self, code: str) -> str:
-        """v5.2: 移除get_price不支持的skip_paused/fq参数"""
+        """v5.2: 移除get_price不支持的skip_paused/fq参数
+        v5.3: 分钟频率不支持high_limit/low_limit字段，自动拆分为两次调用
+        """
         # skip_paused=False
         code = re.sub(r',\s*skip_paused\s*=\s*\w+', '', code)
         # fq='pre' or fq='daily'
         code = re.sub(r",\s*fq\s*=\s*['\"][^'\"]*['\"]", '', code)
+
+        # 分钟频率 + high_limit/low_limit 字段拆分
+        # 匹配: get_price(stock, end_date=..., frequency='1m', fields=['close', 'high_limit'], count=1)
+        # 中的 high_limit 或 low_limit
+        pattern = re.compile(
+            r"(\s*)(\w+)\s*=\s*get_price\(\s*"
+            r"([^,]+),\s*"                          # stock
+            r"end_date\s*=\s*([^,]+),\s*"            # end_date
+            r"frequency\s*=\s*['\"]1m['\"],\s*"      # frequency='1m'
+            r"fields\s*=\s*\[([^\]]+)\]\s*"           # fields=[...]
+            r",\s*count\s*=\s*(\d+)"                  # count=N
+        )
+
+        def _split_minute_limit_fields(m):
+            indent = m.group(1)
+            var = m.group(2)
+            stock = m.group(3).strip()
+            end_date = m.group(4).strip()
+            fields_str = m.group(5).strip()
+            count = m.group(6)
+
+            fields = [f.strip().strip("'\"") for f in fields_str.split(',')]
+            limit_fields = [f for f in fields if f in ('high_limit', 'low_limit')]
+            price_fields = [f for f in fields if f not in ('high_limit', 'low_limit')]
+
+            if not limit_fields:
+                return m.group(0)  # 没有涨跌停字段，不处理
+
+            result_lines = []
+            # 获取价格字段（分钟频率）
+            if price_fields:
+                price_fields_str = ', '.join([f"'{f}'" for f in price_fields])
+                result_lines.append(
+                    f"{indent}{var}_price = get_price({stock}, end_date={end_date}, frequency='1m', "
+                    f"fields=[{price_fields_str}], count={count})"
+                )
+            # 获取涨跌停字段（日线频率）
+            if limit_fields:
+                limit_fields_str = ', '.join([f"'{f}'" for f in limit_fields])
+                result_lines.append(
+                    f"{indent}{var}_limit = get_price({stock}, end_date={end_date}, frequency='daily', "
+                    f"fields=[{limit_fields_str}], count=1)"
+                )
+            # 合并结果（取价格和涨跌停价）
+            result_lines.append(
+                f"{indent}if {var}_price is None or {var}_limit is None: continue"
+            )
+
+            self.conversion_report['changes'].append(
+                "get_price分钟频率+high_limit: 拆分为分钟获取价格+日线获取涨跌停价"
+            )
+            return '\n'.join(result_lines)
+
+        code = pattern.sub(_split_minute_limit_fields, code)
+
+        # 转换拆分后的iloc引用：var.iloc[0, 0] < var.iloc[0, 1] → var_price.iloc[0, 0] < var_limit.iloc[0, 0]
+        # 找到所有被拆分的变量名，替换后续的iloc比较
+        split_vars = set(re.findall(
+            r'(\w+)_price\s*=\s*get_price\([^)]+frequency\s*=\s*[\'"]1m[\'"]',
+            code
+        ))
+        for var in split_vars:
+            if f'{var}_price' in code and f'{var}_limit' in code:
+                # var.iloc[0, 0] → var_price.iloc[0, 0]
+                code = re.sub(
+                    rf'\b{var}\.iloc\[0,\s*0\]',
+                    f'{var}_price.iloc[0, 0]',
+                    code
+                )
+                # var.iloc[0, 1] → var_limit.iloc[0, 0]  (high_limit在limit_df中是第0列)
+                code = re.sub(
+                    rf'\b{var}\.iloc\[0,\s*1\]',
+                    f'{var}_limit.iloc[0, 0]',
+                    code
+                )
+
+        return code
+
+            self.conversion_report['changes'].append(
+                "get_price分钟频率+high_limit: 拆分为分钟获取价格+日线获取涨跌停价"
+            )
+            return '\n'.join(result_lines)
+
+        code = pattern.sub(_split_minute_limit_fields, code)
         return code
 
     def _convert_close_position(self, code: str) -> str:
