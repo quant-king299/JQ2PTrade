@@ -527,11 +527,14 @@ def get_stock_list(context):
     # ---- 4. 按流通市值排序 ----
     try:
         df_mkt = get_fundamentals(top_stocks, 'valuation',
-                                  fields=['circulating_market_cap'],
+                                  fields=['a_floats'],
                                   date=yesterday.strftime('%Y%m%d'), is_dataframe=True)
     except Exception:
         df_mkt = None
-    if df_mkt is None or df_mkt.empty:
+    if df_mkt is not None and not df_mkt.empty and 'a_floats' in df_mkt.columns:
+        df_mkt = df_mkt.sort_values('a_floats', ascending=True)
+        target_list = list(df_mkt.index)
+    else:
         # PTrade获取失败，用tushare兜底
         try:
             ts_codes = _batch_ts_codes(top_stocks)
@@ -545,15 +548,12 @@ def get_stock_list(context):
                 df_mkt = pd.concat(dfs, ignore_index=True)
                 df_mkt.index = _batch_jq_codes(df_mkt['ts_code'].tolist())
                 df_mkt = df_mkt.sort_values('circ_mv', ascending=True)
+                target_list = list(df_mkt.index)
+            else:
+                target_list = top_stocks
         except Exception:
-            df_mkt = None
-    if df_mkt is None or df_mkt.empty:
-        log.error("【选股】获取流通市值排序失败，使用原始排序")
-        target_list = top_stocks
-    else:
-        if 'circ_mv' in df_mkt.columns:
-            df_mkt = df_mkt.sort_values('circ_mv', ascending=True)
-        target_list = list(df_mkt.index)
+            log.error("【选股】获取流通市值排序失败，使用原始排序")
+            target_list = top_stocks
 
     # 过滤低价股
     target_list = filter_price_too_low(context, target_list)
@@ -599,9 +599,9 @@ def prepare_stock_list(context):
     context.high_limit_list = []
     if context.hold_list:
         df = get_price(context.hold_list, end_date=context.previous_date.strftime('%Y%m%d'),
-                       frequency='daily', fields=['close', 'high_limit', 'paused'],
+                       frequency='daily', fields=['close', 'high_limit', 'is_open'],
                        count=1)
-        context.high_limit_list = df[(df['close'] == df['high_limit']) & (df['paused'] == 0)]['code'].tolist()
+        context.high_limit_list = df[(df['close'] == df['high_limit']) & (df['is_open'] == 1)]['code'].tolist()
     log.info("【盘前准备】昨日涨停持仓股: %d 只" % len(context.high_limit_list))
     log.info("【盘前准备】完成")
 
@@ -628,7 +628,7 @@ def daily_adjustment(context):
             score = top_scores.loc[stock, 'total_score']
             try:
                 _info = get_stock_info(stock)
-                name = _info.get(stock, {}).get('display_name', stock) if isinstance(_info, dict) else getattr(_info, 'display_name', stock)
+                name = _info.get(stock, {}).get('stock_name', stock) if isinstance(_info, dict) else getattr(_info, 'stock_name', stock)
             except:
                 name = stock
             log.info("    %s %-8s 得分: %.2f" % (stock, name, score))
@@ -770,7 +770,7 @@ def get_recent_limit_up_stock(context, stock_list, recent_days):
     yesterday = context.previous_date
     h = get_price(stock_list, end_date=yesterday.strftime('%Y%m%d'), frequency='daily',
                   fields=['close', 'high_limit', 'paused'], count=recent_days)
-    s_limit = h[(h['close'] == h['high_limit']) & (h['paused'] == 0)].groupby('code')['high_limit'].count()
+    s_limit = h[(h['close'] == h['high_limit']) & (h['is_open'] == 1)].groupby('code')['high_limit'].count()
     limit_up_stocks = s_limit.index.tolist()
     log.info("【过滤-近期涨停】检出 %d 只" % len(limit_up_stocks))
     return limit_up_stocks
@@ -829,7 +829,7 @@ def open_position(security, value, context, reason=''):
     if o is not None and o != '':
         try:
             _info = get_stock_info(security)
-            name = _info.get(security, {}).get('display_name', security) if isinstance(_info, dict) else str(security)
+            name = _info.get(security, {}).get('stock_name', security) if isinstance(_info, dict) else str(security)
         except Exception:
             name = str(security)
         industry = get_industry_name(security, context.previous_date)
@@ -859,7 +859,7 @@ def close_position(context, stock, reason=''):
     if o is not None and o != '':
         try:
             _info = get_stock_info(stock)
-            name = _info.get(stock, {}).get('display_name', stock) if isinstance(_info, dict) else str(stock)
+            name = _info.get(stock, {}).get('stock_name', stock) if isinstance(_info, dict) else str(stock)
         except Exception:
             name = str(stock)
         buy_info = context.hold_dict.get(stock, {})
