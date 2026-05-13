@@ -14,30 +14,11 @@ JQ 数据函数的 Tushare 替代实现
 _TUSHARE_FUNCTIONS = '''
 # ======================================================================
 # Tushare 数据函数（替代聚宽缺失 API）
-# 注意: Token从环境变量/.env读取，不硬编码在代码中（安全）
-# 使用前请确保已设置环境变量 TUSHARE_TOKEN 或在同级目录有 .env 文件
+# 注意: 请将下方 test_token 替换为你自己的 Tushare Token
+# 获取地址: https://tushare.pro/register
 # ======================================================================
 import tushare as ts
-import os
-
-_tushare_token = os.environ.get('TUSHARE_TOKEN', '')
-if not _tushare_token:
-    try:
-        from pathlib import Path
-        for _p in [Path('.') / '.env', Path(__file__).parent / '.env']:
-            if _p.exists():
-                for _line in open(_p, 'r', encoding='utf-8'):
-                    _line = _line.strip()
-                    if _line.startswith('TUSHARE_TOKEN='):
-                        _tushare_token = _line.split('=', 1)[1].strip().strip('"').strip("'")
-                        break
-                if _tushare_token:
-                    break
-    except Exception:
-        pass
-if not _tushare_token:
-    print('[WARN] 未找到Tushare Token，请设置环境变量 TUSHARE_TOKEN 或配置 .env 文件')
-ts.set_token(_tushare_token)
+ts.set_token('test_token')
 _ts_pro = ts.pro_api()
 
 def _ts_today():

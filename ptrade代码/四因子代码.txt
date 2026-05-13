@@ -1,0 +1,890 @@
+# 聚宽策略转Ptrade - HYBRID版本
+# 转换时间: 2026-05-13
+# 转换器版本: v5.2 + 手动PTrade兼容修复
+
+
+# ======================================================================
+# 以下函数替代聚宽 API（基于 Tushare 实现，PTrade 已预装 tushare）
+# ======================================================================
+import tushare as ts
+ts.set_token('test_token')
+_ts_pro = ts.pro_api()
+
+def _ts_today():
+    """获取当前日期字符串 YYYYMMDD"""
+    import datetime
+    return datetime.datetime.now().strftime('%Y%m%d')
+
+def _ts_code_convert(jq_code):
+    """聚宽代码 -> Tushare代码: 000001.XSHE -> 000001.SZ"""
+    if '.' in jq_code:
+        code, suffix = jq_code.split('.')
+        if suffix in ('XSHE', 'SZ'):
+            return code + '.SZ'
+        elif suffix in ('XSHG', 'SS', 'SH'):
+            return code + '.SH'
+    return jq_code
+
+def _jq_code_convert(ts_code):
+    """Tushare代码 -> 聚宽代码: 000001.SZ -> 000001.XSHE"""
+    if '.' in ts_code:
+        code, suffix = ts_code.split('.')
+        if suffix == 'SZ':
+            return code + '.XSHE'
+        elif suffix == 'SH':
+            return code + '.XSHG'
+    return ts_code
+
+def _batch_ts_codes(jq_codes):
+    """批量转换代码格式"""
+    return [_ts_code_convert(c) for c in jq_codes]
+
+def _batch_jq_codes(ts_codes):
+    """批量转换回聚宽格式"""
+    return [_jq_code_convert(c) for c in ts_codes]
+
+def get_extras(field, security_list=None, end_date=None, count=1):
+    """
+    替代聚宽 get_extras()
+    支持字段: is_st, acc_net_value, unit_net_value, futures_sett_price
+    """
+    import pandas as pd
+    today = end_date.strftime('%Y%m%d') if end_date else _ts_today()
+
+    if field == 'is_st':
+        # 通过股票名称判断ST
+        try:
+            df = _ts_pro.namechange(ts_code='', fields='ts_code,name')
+            st_stocks = set(df[df['name'].str.contains('ST', na=False)]['ts_code'].tolist())
+            codes = _batch_ts_codes(security_list) if security_list else list(st_stocks)
+            result = pd.Series({c: (_ts_code_convert(c) in st_stocks) for c in (security_list or codes)}, dtype=bool)
+            return result
+        except Exception:
+            return pd.Series(dtype=bool)
+
+    elif field in ('acc_net_value', 'unit_net_value'):
+        # 基金净值
+        try:
+            codes = _batch_ts_codes(security_list) if security_list else []
+            if not codes:
+                return pd.DataFrame()
+            all_data = []
+            for code in codes:
+                df = _ts_pro.fund_nav(ts_code=code, end_date=today)
+                if df is not None and not df.empty:
+                    all_data.append(df.head(count))
+            if all_data:
+                result = pd.concat(all_data, ignore_index=True)
+                col = 'accum_nav' if field == 'acc_net_value' else 'unit_nav'
+                return result.set_index('end_date')[col] if col in result.columns else pd.Series(dtype=float)
+            return pd.Series(dtype=float)
+        except Exception:
+            return pd.Series(dtype=float)
+
+    elif field == 'futures_sett_price':
+        try:
+            codes = _batch_ts_codes(security_list) if security_list else []
+            all_data = []
+            for code in codes:
+                df = _ts_pro.futures_daily(ts_code=code, end_date=today, limit=count)
+                if df is not None and not df.empty:
+                    all_data.append(df)
+            if all_data:
+                result = pd.concat(all_data, ignore_index=True)
+                return result.set_index('trade_date')['settle'] if 'settle' in result.columns else pd.Series(dtype=float)
+            return pd.Series(dtype=float)
+        except Exception:
+            return pd.Series(dtype=float)
+
+    return pd.Series(dtype=float)
+
+
+# 申万行业股票映射缓存（tushare获取，回测期间只初始化一次）
+_sw_ind_cache = None
+
+def _init_sw_industry():
+    """通过tushare获取申万一级行业成分股映射，缓存到全局变量"""
+    global _sw_ind_cache
+    if _sw_ind_cache is not None:
+        return
+    import pandas as pd
+    _sw_ind_cache = {}
+    _SW1_NAME_MAP = {
+        '801010': '农林牧渔I', '801020': '采掘I', '801030': '化工I', '801040': '钢铁I',
+        '801050': '有色金属I', '801060': '建筑建材I', '801070': '机械设备I', '801080': '电子I',
+        '801090': '交运设备I', '801100': '信息设备I', '801110': '家用电器I', '801120': '食品饮料I',
+        '801130': '纺织服装I', '801140': '轻工制造I', '801150': '医药生物I', '801160': '公用事业I',
+        '801170': '交通运输I', '801180': '房地产I', '801190': '金融服务I', '801200': '商业贸易I',
+        '801210': '休闲服务I', '801220': '信息服务I', '801230': '综合I',
+        '801710': '建筑材料I', '801720': '建筑装饰I', '801730': '电气设备I', '801740': '国防军工I',
+        '801750': '计算机I', '801760': '传媒I', '801770': '通信I', '801780': '银行I',
+        '801790': '非银金融I', '801880': '汽车I', '801890': '机械设备I',
+        '801950': '煤炭I', '801960': '石油石化I', '801970': '环保I', '801980': '美容护理I',
+    }
+    try:
+        ind_df = _ts_pro.index_classify(level='L1', src='SW2021')
+        for _, row in ind_df.iterrows():
+            ts_ind_code = row['index_code']
+            sw_code = ts_ind_code.replace('.SI', '')
+            ind_name = _SW1_NAME_MAP.get(sw_code, row.get('industry_name', '') + 'I')
+            try:
+                members = _ts_pro.index_member_all(l1_code=ts_ind_code, fields='ts_code')
+                if members is not None and not members.empty:
+                    for ts_code in members['ts_code'].tolist():
+                        code, suffix = ts_code.split('.')
+                        ptrade_code = code + ('.SS' if suffix == 'SH' else '.' + suffix)
+                        _sw_ind_cache[ptrade_code] = {'industry_code': sw_code, 'industry_name': ind_name}
+            except Exception:
+                pass
+        log.info(f'申万行业映射初始化完成，共{len(_sw_ind_cache)}只股票')
+    except Exception as e:
+        log.info(f'申万行业映射初始化失败: {e}')
+
+def get_industry(security=None, date=None):
+    """替代聚宽 get_industry() - 使用tushare申万行业数据，返回PTrade代码格式"""
+    _init_sw_industry()
+    if security is None or _sw_ind_cache is None:
+        return {}
+    codes = security if isinstance(security, list) else [security]
+    result = {}
+    for code in codes:
+        if code in _sw_ind_cache:
+            result[code] = {'sw_l1': _sw_ind_cache[code]}
+    return result
+
+
+# 聚宽因子名 -> Tushare fina_indicator 字段映射
+_FACTOR_MAP = {
+    'market_cap': 'total_hldr_eqy_exc_min_int',
+    'circulating_market_cap': 'total_hldr_eqy_exc_min_int',
+    'pe_ratio': None,  # 需从 daily_basic 获取
+    'pb_ratio': None,  # 需从 daily_basic 获取
+    'roe': 'roe',
+    'roa': 'roa',
+    'eps': 'eps',
+    'inc_revenue_year_on_year': 'or_yoy',
+    'inc_net_profit_year_on_year': 'netprofit_yoy',
+    'operating_revenue_grow_rate': 'or_yoy',
+    'net_profit_growth_rate': 'netprofit_yoy',
+    'total_profit_growth_rate': 'profit_dedt_yoy',
+    'sales_growth': 'or_yoy',
+    'current_ratio': 'current_ratio',
+    'quick_ratio': 'quick_ratio',
+    'debt_to_asset_ratio': 'debt_to_assets',
+    'gross_income_ratio': 'grossprofit_margin',
+    'roe_ttm': 'roe_ttm',
+    'cash_rate_of_sales': 'ocf_to_or',
+}
+
+def get_factor_values(security_list, factor_list, end_date=None, count=1):
+    """替代聚宽 get_factor_values() - 获取因子数据"""
+    import pandas as pd
+    try:
+        today = end_date.strftime('%Y%m%d') if end_date else _ts_today()
+        codes = _batch_ts_codes(security_list) if security_list else []
+        if isinstance(factor_list, str):
+            factor_list = [factor_list]
+
+        all_factors = {}
+
+        for factor in factor_list:
+            ts_field = _FACTOR_MAP.get(factor)
+
+            if ts_field:
+                # 从 fina_indicator 获取
+                dfs = []
+                for code in codes:
+                    df = _ts_pro.fina_indicator(ts_code=code, end_date=today,
+                                                 fields=f'ts_code,{ts_field}')
+                    if df is not None and not df.empty:
+                        dfs.append(df.head(count))
+                if dfs:
+                    combined = pd.concat(dfs, ignore_index=True)
+                    combined.index = _batch_jq_codes(combined['ts_code'].tolist())
+                    series = combined[ts_field]
+                    # 返回DataFrame(date_index × stock_codes)，兼容聚宽 .iloc[0] 用法
+                    all_factors[factor] = pd.DataFrame([series.values], columns=series.index)
+            elif factor in ('pe_ratio', 'pb_ratio', 'market_cap', 'circulating_market_cap',
+                            'ps_ratio', 'turnover_ratio'):
+                # 从 daily_basic 获取
+                ts_field_map = {
+                    'pe_ratio': 'pe', 'pb_ratio': 'pb',
+                    'market_cap': 'total_mv', 'circulating_market_cap': 'circ_mv',
+                    'ps_ratio': 'ps', 'turnover_ratio': 'turnover_rate',
+                }
+                ts_f = ts_field_map[factor]
+                dfs = []
+                for code in codes:
+                    df = _ts_pro.daily_basic(ts_code=code, trade_date=today,
+                                              fields=f'ts_code,{ts_f}')
+                    if df is not None and not df.empty:
+                        dfs.append(df.head(count))
+                if dfs:
+                    combined = pd.concat(dfs, ignore_index=True)
+                    combined.index = _batch_jq_codes(combined['ts_code'].tolist())
+                    series = combined[ts_f]
+                    all_factors[factor] = pd.DataFrame([series.values], columns=series.index)
+            else:
+                # 未映射的因子返回空DataFrame
+                all_factors[factor] = pd.DataFrame()
+
+        return all_factors
+    except Exception:
+        return {f: pd.DataFrame() for f in (factor_list if isinstance(factor_list, list) else [factor_list])}
+
+
+def get_current_data(security_list=None):
+    """替代聚宽 get_current_data() - 获取实时/最近交易数据"""
+    import pandas as pd
+    try:
+        if security_list is None:
+            return {}
+        codes = _batch_ts_codes(security_list) if isinstance(security_list, list) else [_ts_code_convert(security_list)]
+        today = _ts_today()
+        result = {}
+        for jq_code, ts_code in zip(
+            (security_list if isinstance(security_list, list) else [security_list]),
+            codes
+        ):
+            df = _ts_pro.daily_basic(ts_code=ts_code, trade_date=today,
+                                      fields='ts_code,close,pe,pb,turnover_rate,circ_mv,total_mv')
+            if df is not None and not df.empty:
+                row = df.iloc[0]
+                close = row.get('close', 0)
+                result[jq_code] = type('StockData', (), {
+                    'last_price': close,
+                    'high_limit': round(close * 1.1, 2) if close and close > 0 else 0,
+                    'low_limit': round(close * 0.9, 2) if close and close > 0 else 0,
+                    'paused': False,
+                    'is_st': False,
+                    'money': 0,
+                    'name': jq_code,
+                })()
+        return result
+    except Exception:
+        return {}
+
+
+def get_all_securities(types='stock', date=None):
+    """替代聚宽 get_all_securities() - 支持多种证券类型"""
+    import pandas as pd
+    try:
+        if types == 'stock' or types == ['stock']:
+            df = _ts_pro.stock_basic(list_status='L', fields='ts_code,symbol,name,area,industry,list_date')
+            if df is not None and not df.empty:
+                df['src'] = 'TS'
+                jq_codes = _batch_jq_codes(df['ts_code'].tolist())
+                df.index = jq_codes
+                return df
+        elif types == 'fund' or types == ['fund']:
+            df = _ts_pro.fund_basic(market='E', fields='ts_code,symbol,name,fund_type,issue_date')
+            if df is not None and not df.empty:
+                jq_codes = _batch_jq_codes(df['ts_code'].tolist())
+                df.index = jq_codes
+                return df
+        elif types == 'index' or types == ['index']:
+            df = _ts_pro.index_basic(market='SSE', fields='ts_code,name,publish_date')
+            df2 = _ts_pro.index_basic(market='SZSE', fields='ts_code,name,publish_date')
+            frames = [df, df2] if df2 is not None and not df2.empty else [df]
+            if frames:
+                combined = pd.concat(frames, ignore_index=True)
+                combined.index = _batch_jq_codes(combined['ts_code'].tolist())
+                return combined
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_current_data_compat(security_list=None):
+    """模拟聚宽get_current_data()功能，使用get_history批量获取（PTrade兼容）"""
+    import pandas as pd
+
+    if security_list is None or not security_list:
+        return {}
+
+    result = {}
+
+    # 批量获取收盘价和是否开盘
+    try:
+        df = get_history(1, '1d', ['close', 'is_open', 'high_limit', 'low_limit'], security_list=security_list, include=True, fill='nan')
+
+        if df is not None and not df.empty :
+            for code, group in df.groupby('code'):
+                try:
+                    close_price = float(group['close'].iloc[-1])
+                    is_open = float(group['is_open'].iloc[-1]) if 'is_open' in group.columns else 1
+                    high_limit = float(group['high_limit'].iloc[-1]) if 'high_limit' in group.columns else 0
+                    low_limit = float(group['low_limit'].iloc[-1]) if 'low_limit' in group.columns else 0
+                except Exception:
+                    close_price = 0
+                    is_open = 1
+                    high_limit = 0
+                    low_limit = 0
+
+                result[code] = type('obj', (), {
+                    'last_price': close_price,
+                    'high_limit': high_limit if high_limit > 0 else round(close_price * 1.1, 2),
+                    'low_limit': low_limit if low_limit > 0 else round(close_price * 0.9, 2),
+                    'paused': (is_open == 0),
+                    'is_st': False,
+                    'name': code,
+                })()
+    except Exception:
+        pass
+
+    # 对没获取到数据的股票，补充默认值（确保不返回空dict）
+    for stock in security_list:
+        if stock not in result:
+            result[stock] = type('obj', (), {
+                'last_price': 0,
+                'high_limit': 0,
+                'low_limit': 0,
+                'paused': False,
+                'is_st': False,
+                'name': stock,
+            })()
+
+    return result
+
+# ========================================
+
+# 策略名称：低成本费用利用率小市值（聚宽版 — 4因子加权排名）
+# 修改时间：2026-05-10
+# 修改内容：评分因子调整为4因子按权重排名
+#   1. ROE排名（roe_ttm）— 越高越好，降序  -权重15%
+#   2. 小市值排名（market_cap）— 越低越好，升序  -权重20%
+#   3. 股价排名（close前收盘价）— 越低越好，升序  -权重15%
+#   4. 现金流收入比（cash_rate_of_sales）— 越高越好，降序  -权重50%
+#   总得分 = 各因子排名 × 对应权重，得分越低越好
+# ============================================================
+
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import copy
+
+
+def initialize(context):
+    """
+    策略初始化函数，仅在回测/模拟启动时执行一次
+    """
+    # ========== 基准与复权设置 ==========
+    # 以中证1000指数作为业绩基准
+    set_benchmark('000852.XSHG')
+    # 开启真实价格（动态复权）模式，分红送股会自动处理持仓与现金
+    # [已移除] set_option()  # PTrade不支持此API
+    # 开启避免未来数据模式，防止数据穿越
+    # [已移除] set_option()  # PTrade不支持此API
+    # 屏蔽订单模块的 error 级别日志，避免刷屏
+    # [已移除] log.set_level()  # PTrade不支持此API
+    # ========== 交易成本设置 ==========
+    # 滑点：固定买卖各0.2%
+    set_slippage(0.002)
+    # 佣金与印花税
+    # [已移除] set_order_cost()  # PTrade不支持此API
+    # ========== 策略参数 ==========
+    context.stock_num = 30          # 目标持仓数量
+    context.candidate_num = 90      # 候选池最大数量
+    context.limit_days = 20         # 近期不再买入和涨停过滤的天数
+
+    # ========== 运行状态变量 ==========
+    context.hold_list = []                    # 当前交易日持仓列表
+    context.history_hold_list = []            # 历史持仓列表（最近N天）
+    context.not_buy_again_list = []           # 近期不再买入名单
+    context.pd_log = pd.DataFrame(columns=[   # 交易记录DataFrame（仅内存，无持久化）
+        'date', 'action', 'stock', 'name', 'shares', 'price',
+        'total_value', 'reason', 'days_held', 'profit_pct', 'industry'
+    ])
+    context.hold_dict = {}                    # 持仓信息字典，记录买入日期与行业
+    context.rank_df = pd.DataFrame()          # 最近一次选股排名结果（调试用）
+
+    # ========== 定时运行函数 ==========
+    # 盘前准备：9:05 运行（以中证1000为参考时间）
+    run_daily(context, prepare_stock_list, time='9:05')
+    # 核心调仓：9:38 运行
+    run_daily(context, daily_adjustment, time='09:38')
+    # 涨停打开检查：14:30 运行
+    run_daily(context, check_limit_up, time='14:30')
+    # 已移除 15:10 日志保存
+
+
+# ============================================================
+# 选股模块（4因子加权排名）
+# ============================================================
+def get_stock_list(context):
+    """
+    根据四个因子加权打分，筛选出候选股票池
+    返回：
+        initial_list : 基础过滤后的全市场股票列表
+        target_list  : 最终候选买入股票列表（最多 context.candidate_num 只）
+        rank_df      : 包含总分的 DataFrame，供查看排名
+    """
+    yesterday = context.previous_date
+    log.info("【选股】开始运行，基准日期：%s" % yesterday.strftime('%Y-%m-%d'))
+
+    # ---- 1. 基础股票池 ----
+    initial_list = list(get_Ashares())
+    log.info("【选股-步骤1】全市场股票数量: %d" % len(initial_list))
+
+    # 过滤次新股
+    initial_list = filter_new_stock(context, initial_list)
+    log.info("【选股-步骤2】去除次新股后: %d" % len(initial_list))
+    # 过滤科创板、创业板
+    initial_list = filter_kcbj_stock(initial_list)
+    log.info("【选股-步骤3】去除科创板/创业板后: %d" % len(initial_list))
+    # 过滤ST（通过股票名称判断）
+    st_data = get_extras('is_st', initial_list, end_date=yesterday)
+    if isinstance(st_data, dict):
+        initial_list = [s for s in initial_list if not st_data.get(s, False)]
+    elif hasattr(st_data, 'index'):
+        st_set = set(st_data[st_data].index) if len(st_data) > 0 else set()
+        initial_list = [s for s in initial_list if s not in st_set]
+    log.info("【选股-步骤4】去除ST后: %d" % len(initial_list))
+    # 二次过滤ST（名称校验）
+    initial_list = filter_st_stock(initial_list)
+    log.info("【选股-步骤5】二次去除风险警示股后: %d" % len(initial_list))
+
+    if not initial_list:
+        log.warning("【选股】基础股票池为空，无法继续！")
+        return [], [], pd.DataFrame()
+
+    # ---- 2. 获取因子数据 ----
+    FACTOR_LIST = ['roe_ttm', 'market_cap', 'cash_rate_of_sales']
+    try:
+        factor_data = get_factor_values(initial_list, FACTOR_LIST,
+                                        end_date=yesterday.strftime('%Y%m%d'), count=1)
+        log.info("【选股-步骤6】因子数据获取成功 (%s)" % ', '.join(FACTOR_LIST))
+    except Exception as e:
+        log.error("【选股】获取因子数据失败: %s" % e)
+        return initial_list, [], pd.DataFrame()
+
+    # 构建 DataFrame
+    df = pd.DataFrame(index=initial_list)
+    for f in FACTOR_LIST:
+        try:
+            df[f] = factor_data[f].iloc[0]
+        except Exception as e:
+            log.error("【选股】因子 %s 赋值失败: %s" % (f, e))
+            continue
+
+    # 获取前收盘价作为股价因子
+    try:
+        price_df = get_price(initial_list, end_date=yesterday.strftime('%Y%m%d'), count=1,
+                             fields=['close'])
+        if price_df is not None and not price_df.empty:
+            price_dict = price_df.set_index('code')['close'].to_dict()
+            df['close'] = df.index.map(lambda x: price_dict.get(x, np.nan))
+        log.info("【选股-步骤7】股价数据获取完成")
+    except Exception as e:
+        log.error("【选股】获取股价失败: %s" % e)
+        df['close'] = np.nan
+
+    # 删除缺失值
+    before_drop = len(df)
+    df = df.dropna()
+    log.info("【选股-步骤8】去除因子缺失值后: %d -> %d" % (before_drop, len(df)))
+
+    if df.empty:
+        log.warning("【选股】所有股票均存在缺失因子！")
+        return initial_list, [], pd.DataFrame()
+
+    # ---- 3. 加权排名 ----
+    rank_directions = {
+        'roe_ttm': False,           # 降序（值越大排名越小）
+        'market_cap': True,         # 升序（市值越小排名越小）
+        'close': True,              # 升序（股价越低排名越小）
+        'cash_rate_of_sales': False # 降序（值越大排名越小）
+    }
+
+    # 各因子对应的权重
+    factor_weights = {
+        'roe_ttm': 0.15,
+        'market_cap': 0.20,
+        'close': 0.15,
+        'cash_rate_of_sales': 0.50
+    }
+
+    rank_df = pd.DataFrame(index=df.index)
+    for factor, ascending in rank_directions.items():
+        if factor in df.columns:
+            weight = factor_weights.get(factor, 0.0)
+            rank_col = factor + '_rank'
+            rank_df[rank_col] = df[factor].rank(ascending=ascending) * weight
+        else:
+            log.warning("【选股】因子 %s 缺失，跳过" % factor)
+
+    # 计算总分
+    rank_cols = [c for c in rank_df.columns if c.endswith('_rank')]
+    rank_df['total_score'] = rank_df[rank_cols].sum(axis=1)
+    log.info("【选股-步骤9】四因子加权排名完成，总分范围: %.2f ~ %.2f" %
+             (rank_df['total_score'].min(), rank_df['total_score'].max()))
+
+    # 取前10%
+    top_n = max(1, int(len(rank_df) * 0.1))
+    top_stocks = rank_df.nsmallest(top_n, 'total_score').index.tolist()
+    log.info("【选股-步骤10】前10%%股票: %d 只" % len(top_stocks))
+
+    # ---- 4. 按流通市值排序 ----
+    try:
+        df_mkt = get_fundamentals(top_stocks, 'valuation',
+                                  fields=['circulating_market_cap'],
+                                  date=yesterday.strftime('%Y%m%d'), is_dataframe=True)
+    except Exception:
+        df_mkt = None
+    if df_mkt is None or df_mkt.empty:
+        # PTrade获取失败，用tushare兜底
+        try:
+            ts_codes = _batch_ts_codes(top_stocks)
+            dfs = []
+            for tc in ts_codes:
+                d = _ts_pro.daily_basic(ts_code=tc, trade_date=yesterday.strftime('%Y%m%d'),
+                                        fields='ts_code,circ_mv')
+                if d is not None and not d.empty:
+                    dfs.append(d)
+            if dfs:
+                df_mkt = pd.concat(dfs, ignore_index=True)
+                df_mkt.index = _batch_jq_codes(df_mkt['ts_code'].tolist())
+                df_mkt = df_mkt.sort_values('circ_mv', ascending=True)
+        except Exception:
+            df_mkt = None
+    if df_mkt is None or df_mkt.empty:
+        log.error("【选股】获取流通市值排序失败，使用原始排序")
+        target_list = top_stocks
+    else:
+        if 'circ_mv' in df_mkt.columns:
+            df_mkt = df_mkt.sort_values('circ_mv', ascending=True)
+        target_list = list(df_mkt.index)
+
+    # 过滤低价股
+    target_list = filter_price_too_low(context, target_list)
+    log.info("【选股-步骤11】过滤低价股后: %d" % len(target_list))
+
+    # 限制候选池数量
+    target_list = target_list[:context.candidate_num]
+    log.info("【选股-步骤12】最终候选池数量: %d (上限 %d)" % (len(target_list), context.candidate_num))
+
+    return initial_list, target_list, rank_df
+
+
+# ============================================================
+# 盘前准备
+# ============================================================
+def prepare_stock_list(context):
+    """
+    每天9:05运行，主要完成：
+    1. 记录当前持仓
+    2. 更新历史持仓，生成近期不再买入名单
+    3. 记录昨日涨停股（供14:30检查用）
+    """
+    log.info("【盘前准备】开始")
+
+    # 当前持仓
+    context.hold_list = list(context.portfolio.positions.keys())
+    log.info("【盘前准备】当前持仓数量: %d" % len(context.hold_list))
+
+    # 历史持仓记录
+    context.history_hold_list.append(context.hold_list)
+    if len(context.history_hold_list) >= context.limit_days:
+        context.history_hold_list = context.history_hold_list[-context.limit_days:]
+    log.info("【盘前准备】历史持仓天数: %d / %d" % (len(context.history_hold_list), context.limit_days))
+
+    # 近期不再买入名单
+    temp_set = set()
+    for hl in context.history_hold_list:
+        temp_set = temp_set.union(set(hl))
+    context.not_buy_again_list = list(temp_set)
+    log.info("【盘前准备】近期不再买入数量: %d" % len(context.not_buy_again_list))
+
+    # 昨日涨停股（供14:30涨停打开检查用）
+    context.high_limit_list = []
+    if context.hold_list:
+        df = get_price(context.hold_list, end_date=context.previous_date.strftime('%Y%m%d'),
+                       frequency='daily', fields=['close', 'high_limit', 'paused'],
+                       count=1)
+        context.high_limit_list = df[(df['close'] == df['high_limit']) & (df['paused'] == 0)]['code'].tolist()
+    log.info("【盘前准备】昨日涨停持仓股: %d 只" % len(context.high_limit_list))
+    log.info("【盘前准备】完成")
+
+
+# ============================================================
+# 每日调仓（核心）
+# ============================================================
+def daily_adjustment(context):
+    """
+    每天9:38运行，完成选股、卖出、过滤、买入等完整调仓流程
+    """
+    log.info("【调仓】开始执行")
+
+    # 获取候选池
+    stock_list_without_new_st_kcbj, target_list, rank_df = get_stock_list(context)
+    target_list = target_list[:context.candidate_num]
+    context.rank_df = rank_df
+
+    # 打印前20名得分
+    if not rank_df.empty:
+        top_scores = rank_df.nsmallest(20, 'total_score')[['total_score']]
+        log.info("【调仓-排名展示】候选池前20名因子总得分：")
+        for stock in top_scores.index:
+            score = top_scores.loc[stock, 'total_score']
+            try:
+                _info = get_stock_info(stock)
+                name = _info.get(stock, {}).get('display_name', stock) if isinstance(_info, dict) else getattr(_info, 'display_name', stock)
+            except:
+                name = stock
+            log.info("    %s %-8s 得分: %.2f" % (stock, name, score))
+
+    # ===== 卖出 =====
+    log.info("【调仓-卖出】开始检查...")
+    for stock in context.hold_list:
+        if (stock not in target_list) and (stock not in context.high_limit_list):
+            log.info("【调仓-卖出】%s 跌出候选池，执行卖出" % stock)
+            close_position(context, stock, reason='跌出候选池')
+    log.info("【调仓-卖出】完成")
+
+    # ===== 买入前过滤 =====
+    target_list = filter_paused_stock(target_list)
+    log.info("【调仓-过滤】去除停牌股: %d" % len(target_list))
+    target_list = filter_limit_stock(context, target_list)
+    log.info("【调仓-过滤】去除涨跌停限制: %d" % len(target_list))
+    recent_limits = get_recent_limit_up_stock(context, target_list, context.limit_days)
+    log.info("【调仓-过滤】近期涨停股: %d 只" % len(recent_limits))
+    black_list = list(set(context.not_buy_again_list).union(set(recent_limits)))
+    target_list = [s for s in target_list if s not in black_list]
+    log.info("【调仓-过滤】最终过滤后: %d" % len(target_list))
+    target_list = filter_industry_concentration(context, target_list)
+    log.info("【调仓-过滤】行业集中度过滤后: %d" % len(target_list))
+
+    # ===== 买入 =====
+    holdings = list(context.portfolio.positions.keys())
+    current_data = get_current_data_compat(target_list)
+    target_num = min(context.stock_num, len(set(target_list).union(holdings)))
+    position_count = len(holdings)
+    need_buy = target_num - position_count
+
+    log.info("【调仓-买入】当前 %d，目标 %d，需买入 %d" % (position_count, target_num, need_buy))
+
+    if need_buy > 0:
+        avg_value = context.portfolio.available_cash / need_buy
+        log.info("【调仓-买入】每只计划买入 %.2f 元" % avg_value)
+
+        affordable = [s for s in target_list if s not in holdings
+                      and avg_value >= current_data[s].last_price * 100]
+        while len(affordable) < need_buy and target_num > position_count:
+            target_num -= 1
+            need_buy = target_num - position_count
+            if need_buy <= 0:
+                break
+            avg_value = context.portfolio.available_cash / need_buy
+            affordable = [s for s in target_list if s not in holdings
+                          and avg_value >= current_data[s].last_price * 100]
+            log.info("【调仓-买入】调整目标至 %d，可买 %d 只" % (target_num, len(affordable)))
+
+        bought = 0
+        for stock in affordable:
+            if open_position(stock, avg_value, context, reason='候选池买入'):
+                bought += 1
+                if len(context.portfolio.positions) >= target_num:
+                    break
+        log.info("【调仓-买入】实际买入 %d 只" % bought)
+    else:
+        log.info("【调仓-买入】无需买入")
+
+    log.info("【调仓】结束，持仓 %d 只" % len(context.portfolio.positions))
+
+
+# ============================================================
+# 14:30 涨停打开检查
+# ============================================================
+def check_limit_up(context):
+    """
+    每天14:30运行，检查昨日涨停且今日持仓的股票：
+    如果当前价格已经低于涨停价（即涨停打开），则立即全部卖出
+    """
+    log.info("【涨停检查】开始")
+    current_data = get_current_data_compat(context.high_limit_list)
+    count = 0
+    for stock in context.high_limit_list:
+        if stock in context.portfolio.positions:
+            if current_data[stock].last_price < current_data[stock].high_limit:
+                log.info("【涨停检查】涨停打开，卖出 %s" % stock)
+                close_position(context, stock, reason='涨停打开卖出')
+                count += 1
+    log.info("【涨停检查】结束，本次卖出 %d 只" % count)
+
+
+# ============================================================
+# 各种过滤函数
+# ============================================================
+def filter_paused_stock(stock_list):
+    current_data = get_current_data_compat(stock_list)
+    result = [s for s in stock_list if not current_data[s].paused]
+    if len(stock_list) != len(result):
+        log.info("【过滤-停牌】剔除 %d 只" % (len(stock_list) - len(result)))
+    return result
+
+def filter_st_stock(stock_list):
+    current_data = get_current_data_compat(stock_list)
+    result = [s for s in stock_list
+              if not (current_data[s].is_st or 'ST' in current_data[s].name
+                      or '*' in current_data[s].name or '退' in current_data[s].name)]
+    if len(stock_list) != len(result):
+        log.info("【过滤-ST】剔除 %d 只" % (len(stock_list) - len(result)))
+    return result
+
+def filter_new_stock(context, stock_list):
+    import datetime as _dt
+    yesterday = context.previous_date
+    result = []
+    for s in stock_list:
+        try:
+            info = get_stock_info(s)
+            listed = info.get(s, {}).get('listed_date', '2000-01-01') if isinstance(info, dict) else '2000-01-01'
+            listed_date = _dt.datetime.strptime(listed, '%Y-%m-%d').date()
+            if (yesterday - listed_date).days >= 375:
+                result.append(s)
+        except Exception:
+            result.append(s)
+    if len(stock_list) != len(result):
+        log.info("【过滤-次新】剔除 %d 只" % (len(stock_list) - len(result)))
+    return result
+
+def filter_kcbj_stock(stock_list):
+    result = [s for s in stock_list if not (s[0] in '48' or s[:2] == '68')]
+    if len(stock_list) != len(result):
+        log.info("【过滤-科创/创业】剔除 %d 只" % (len(stock_list) - len(result)))
+    return result
+
+def filter_limit_stock(context, stock_list):
+    current_data = get_current_data_compat(stock_list)
+    holdings = list(context.portfolio.positions.keys())
+    result = [s for s in stock_list
+              if (s in holdings) or (current_data[s].low_limit < current_data[s].last_price < current_data[s].high_limit)]
+    diff = len(stock_list) - len(result)
+    if diff:
+        log.info("【过滤-涨跌停】剔除 %d 只" % diff)
+    return result
+
+def get_recent_limit_up_stock(context, stock_list, recent_days):
+    if not stock_list:
+        return []
+    yesterday = context.previous_date
+    h = get_price(stock_list, end_date=yesterday.strftime('%Y%m%d'), frequency='daily',
+                  fields=['close', 'high_limit', 'paused'], count=recent_days)
+    s_limit = h[(h['close'] == h['high_limit']) & (h['paused'] == 0)].groupby('code')['high_limit'].count()
+    limit_up_stocks = s_limit.index.tolist()
+    log.info("【过滤-近期涨停】检出 %d 只" % len(limit_up_stocks))
+    return limit_up_stocks
+
+def filter_price_too_low(context, stock_list):
+    if not stock_list:
+        return []
+    yesterday = context.previous_date
+    df = get_price(stock_list, end_date=yesterday.strftime('%Y%m%d'), count=1,
+                   fields=['close'])
+    low = df[df['close'] < 2]['code'].tolist()
+    result = [s for s in stock_list if s not in low]
+    diff = len(stock_list) - len(result)
+    if diff:
+        log.info("【过滤-低价股】剔除 %d 只" % diff)
+    return result
+
+def filter_industry_concentration(context, stock_list):
+    holdings = list(context.portfolio.positions.keys())
+    total_value = context.portfolio.total_value
+    industry_value = {}
+    for stock in holdings:
+        pos = context.portfolio.positions[stock]
+        try:
+            ind = get_industry([stock], date=context.previous_date)[stock]
+            sw = ind['sw_l1'].get('industry_code', '')
+            if sw:
+                industry_value[sw] = industry_value.get(sw, 0) + pos.total_amount * pos.price
+        except:
+            pass
+
+    max_ratio = 0.10
+    result = []
+    rejected = 0
+    for stock in stock_list:
+        try:
+            ind = get_industry([stock], date=context.previous_date)[stock]
+            sw_code = ind['sw_l1'].get('industry_code', '')
+        except:
+            sw_code = ''
+        if not sw_code or industry_value.get(sw_code, 0) < total_value * max_ratio:
+            result.append(stock)
+        else:
+            rejected += 1
+    if rejected:
+        log.info("【过滤-行业集中度】剔除 %d 只" % rejected)
+    return result
+
+
+# ============================================================
+# 交易执行函数
+# ============================================================
+def open_position(security, value, context, reason=''):
+    o = order_target_value(security, value)
+    # PTrade: order_target_value返回字符串ID或None
+    if o is not None and o != '':
+        try:
+            _info = get_stock_info(security)
+            name = _info.get(security, {}).get('display_name', security) if isinstance(_info, dict) else str(security)
+        except Exception:
+            name = str(security)
+        industry = get_industry_name(security, context.previous_date)
+        # 从持仓获取成交信息
+        pos = context.portfolio.positions.get(security)
+        total_val = value
+        log.info("【买入成交】%s(%s) 金额%.2f 行业:%s 理由:%s" %
+                 (security, name, total_val, industry, reason))
+        context.pd_log.loc[len(context.pd_log)] = {
+            'date': context.current_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            'action': 'BUY', 'stock': security, 'name': name,
+            'shares': 0, 'price': 0, 'total_value': total_val,
+            'reason': reason, 'days_held': 0, 'profit_pct': 0, 'industry': industry
+        }
+        context.hold_dict[security] = {
+            'buy_date': context.previous_date,
+            'industry_sw_l1': industry
+        }
+        return True
+    else:
+        log.warning("【买入失败】%s 委托未成交，资金 %.2f" % (security, value))
+        return False
+
+def close_position(context, stock, reason=''):
+    # PTrade: 传入stock代码，不是position对象
+    o = order_target_value(stock, 0)
+    if o is not None and o != '':
+        try:
+            _info = get_stock_info(stock)
+            name = _info.get(stock, {}).get('display_name', stock) if isinstance(_info, dict) else str(stock)
+        except Exception:
+            name = str(stock)
+        buy_info = context.hold_dict.get(stock, {})
+        days_held = (context.current_dt.date() - buy_info.get('buy_date', context.current_dt.date())).days
+        pos = context.portfolio.positions.get(stock)
+        if pos and hasattr(pos, 'avg_cost') and pos.avg_cost and pos.avg_cost > 0:
+            profit_pct = 100 * (pos.price / pos.avg_cost - 1)
+        else:
+            profit_pct = 0.0
+        industry = buy_info.get('industry_sw_l1', '未知')
+        log.info("【卖出成交】%s(%s) 理由:%s 持仓%d天 盈亏%.2f%% 行业:%s" %
+                 (stock, name, reason, days_held, profit_pct, industry))
+        context.pd_log.loc[len(context.pd_log)] = {
+            'date': context.current_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            'action': 'SELL', 'stock': stock, 'name': name,
+            'shares': 0, 'price': 0, 'total_value': 0,
+            'reason': reason, 'days_held': days_held, 'profit_pct': profit_pct, 'industry': industry
+        }
+        context.hold_dict.pop(stock, None)
+    else:
+        log.warning("【卖出失败】%s 委托未成交" % stock)
+
+def get_industry_name(security, date):
+    try:
+        ind = get_industry([security], date=date)[security]
+        return ind['sw_l1'].get('industry_name', '未知')
+    except:
+        return '未知'
