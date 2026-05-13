@@ -769,7 +769,7 @@ def get_recent_limit_up_stock(context, stock_list, recent_days):
         return []
     yesterday = context.previous_date
     h = get_price(stock_list, end_date=yesterday.strftime('%Y%m%d'), frequency='daily',
-                  fields=['close', 'high_limit', 'paused'], count=recent_days)
+                  fields=['close', 'high_limit', 'is_open'], count=recent_days)
     s_limit = h[(h['close'] == h['high_limit']) & (h['is_open'] == 1)].groupby('code')['high_limit'].count()
     limit_up_stocks = s_limit.index.tolist()
     log.info("【过滤-近期涨停】检出 %d 只" % len(limit_up_stocks))
