@@ -473,141 +473,30 @@ def get_current_data_compat(security_list=None):
         return code
 
     def _handle_get_factor_values(self, code: str, strategy_type: StrategyType) -> str:
-        """处理get_factor_values - 添加Ptrade兼容实现
+        """处理get_factor_values - 移除jqfactor导入
 
         聚宽: from jqfactor import get_factor_values (内置函数)
-        Ptrade: 需要自己实现（基于get_fundamentals封装）
+        Ptrade: 由Tushare注入的get_factor_values实现替代（支持更多因子字段）
+
+        不再添加基于get_fundamentals的compat版本，因为：
+        1. Tushare版本的因子映射更完整（支持roe_ttm、cash_rate_of_sales等TTM因子）
+        2. compat版本会覆盖Tushare版本（Python后定义覆盖前定义）
+        3. PTrade原生get_fundamentals字段有限，不支持TTM类字段
         """
         if not re.search(r'get_factor_values\s*\(', code):
             return code
 
-        # 检测是否导入了jqfactor
-        has_jqfactor_import = 'from jqfactor import' in code or 'import jqfactor' in code
-
-        if has_jqfactor_import:
-            # 添加Ptrade版本的get_factor_values实现
-            compat_function = '''
-# ======================================================================
-# get_factor_values 兼容函数（Ptrade版本）
-# ======================================================================
-# 聚宽的get_factor_values是内置函数，Ptrade需要自己实现
-# 这里基于get_fundamentals封装，提供基本的因子数据获取功能
-#
-# 使用方法:
-#   df = get_factor_values(stocks, 'sales_growth', end_date=date, count=1)
-#
-# 注意: 因子名称需要映射到Ptrade的表和字段
-# ======================================================================
-
-def get_factor_values(stock_list, factor, end_date=None, count=1, **kwargs):
-    """
-    获取因子值（Ptrade兼容版本）
-
-    参数:
-        stock_list: 股票列表
-        factor: 因子名称或因子列表
-        end_date: 结束日期
-        count: 数据条数（暂未实现，默认为1）
-        **kwargs: 其他参数
-
-    返回:
-        DataFrame格式的因子数据
-    """
-    import pandas as pd
-
-    # 因子名称映射：聚宽因子名 -> (Ptrade表名, Ptrade字段名)
-    factor_mapping = {
-        # 估值因子
-        'market_cap': ('valuation', 'total_value'),
-        'circulating_market_cap': ('valuation', 'a_floats'),
-        'pe_ratio': ('valuation', 'pe_ratio'),
-        'pb_ratio': ('valuation', 'pb_ratio'),
-        'ps_ratio': ('valuation', 'ps_ratio'),
-
-        # 财务指标因子
-        'roe': ('indicator', 'roe'),
-        'roa': ('indicator', 'roa'),
-        'eps': ('indicator', 'eps'),
-        'inc_revenue_year_on_year': ('indicator', 'operating_revenue_grow_rate'),
-        'inc_net_profit_year_on_year': ('indicator', 'np_parent_company_cut_yoy'),
-        'operating_revenue_grow_rate': ('indicator', 'operating_revenue_grow_rate'),
-
-        # 增长因子
-        'sales_growth': ('indicator', 'operating_revenue_grow_rate'),
-        'net_profit_growth_rate': ('indicator', 'net_profit_growth_rate'),
-        'total_profit_growth_rate': ('indicator', 'total_profit_growth_rate'),
-
-        # 质量因子
-        'total_shareholder_equity': ('balance_statement', 'total_shareholder_equity'),
-    }
-
-    # 处理单个因子
-    if isinstance(factor, str):
-        if factor not in factor_mapping:
-            # 未映射的因子，尝试直接使用
-            table = 'valuation'
-            field = factor
-        else:
-            table, field = factor_mapping[factor]
-
-        # 获取数据
-        try:
-            df = get_fundamentals(
-                stock_list,
-                table,
-                fields=field,
-                date=end_date,
-                is_dataframe=True
-            )
-
-            if df is not None and not df.empty:
-                # 重命名列
-                df = df.rename(columns={field: factor})
-                return df
-            else:
-                return pd.DataFrame()
-
-        except Exception as e:
-            print(f"获取因子{factor}失败: {e}")
-            return pd.DataFrame()
-
-    # 处理多个因子
-    elif isinstance(factor, list):
-        dfs = []
-        for f in factor:
-            df_f = get_factor_values(stock_list, f, end_date=end_date, count=count, **kwargs)
-            if not df_f.empty:
-                dfs.append(df_f)
-
-        if dfs:
-            # 合并所有因子的DataFrame
-            result = pd.concat(dfs, axis=1)
-            return result
-        else:
-            return pd.DataFrame()
-
-    return pd.DataFrame()
-
-'''
-
-            # 移除jqfactor导入
+        # 移除jqfactor导入
+        if 'from jqfactor import' in code or 'import jqfactor' in code:
             code = re.sub(r'from jqfactor import.*\n?', '', code)
             code = re.sub(r'import jqfactor.*\n?', '', code)
 
-            # 添加兼容函数
-            code = compat_function + '\n' + code
-
             self.conversion_report['changes'].append(
-                'get_factor_values: 已添加Ptrade兼容实现（基于get_fundamentals封装）'
-            )
-
-            self.conversion_report['warnings'].append(
-                "get_factor_values已添加兼容实现，但因子名称可能需要手动调整映射关系"
+                'get_factor_values: 已移除jqfactor导入，使用Tushare版本替代'
             )
         else:
-            # 没有导入jqfactor，可能只是调用
             self.conversion_report['warnings'].append(
-                "检测到get_factor_values使用，但未发现jqfactor导入。请确认是否需要添加兼容实现。"
+                "检测到get_factor_values使用，将使用Tushare注入版本。"
             )
 
         return code

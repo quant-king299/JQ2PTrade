@@ -14,9 +14,30 @@ JQ 数据函数的 Tushare 替代实现
 _TUSHARE_FUNCTIONS = '''
 # ======================================================================
 # Tushare 数据函数（替代聚宽缺失 API）
+# 注意: Token从环境变量/.env读取，不硬编码在代码中（安全）
+# 使用前请确保已设置环境变量 TUSHARE_TOKEN 或在同级目录有 .env 文件
 # ======================================================================
 import tushare as ts
-ts.set_token('%(tushare_token)s')
+import os
+
+_tushare_token = os.environ.get('TUSHARE_TOKEN', '')
+if not _tushare_token:
+    try:
+        from pathlib import Path
+        for _p in [Path('.') / '.env', Path(__file__).parent / '.env']:
+            if _p.exists():
+                for _line in open(_p, 'r', encoding='utf-8'):
+                    _line = _line.strip()
+                    if _line.startswith('TUSHARE_TOKEN='):
+                        _tushare_token = _line.split('=', 1)[1].strip().strip('"').strip("'")
+                        break
+                if _tushare_token:
+                    break
+    except Exception:
+        pass
+if not _tushare_token:
+    print('[WARN] 未找到Tushare Token，请设置环境变量 TUSHARE_TOKEN 或配置 .env 文件')
+ts.set_token(_tushare_token)
 _ts_pro = ts.pro_api()
 
 def _ts_today():
@@ -274,6 +295,8 @@ _FACTOR_MAP = {
     'quick_ratio': 'quick_ratio',
     'debt_to_asset_ratio': 'debt_to_assets',
     'gross_income_ratio': 'grossprofit_margin',
+    'roe_ttm': 'roe_ttm',
+    'cash_rate_of_sales': 'ocf_to_or',
 }
 
 def get_factor_values(security_list, factor_list, end_date=None, count=1):
@@ -301,7 +324,9 @@ def get_factor_values(security_list, factor_list, end_date=None, count=1):
                 if dfs:
                     combined = pd.concat(dfs, ignore_index=True)
                     combined.index = _batch_jq_codes(combined['ts_code'].tolist())
-                    all_factors[factor] = combined[ts_field]
+                    series = combined[ts_field]
+                    # 返回DataFrame(date_index × stock_codes)，兼容聚宽 .iloc[0] 用法
+                    all_factors[factor] = pd.DataFrame([series.values], columns=series.index)
             elif factor in ('pe_ratio', 'pb_ratio', 'market_cap', 'circulating_market_cap',
                             'ps_ratio', 'turnover_ratio'):
                 # 从 daily_basic 获取
@@ -320,14 +345,15 @@ def get_factor_values(security_list, factor_list, end_date=None, count=1):
                 if dfs:
                     combined = pd.concat(dfs, ignore_index=True)
                     combined.index = _batch_jq_codes(combined['ts_code'].tolist())
-                    all_factors[factor] = combined[ts_f]
+                    series = combined[ts_f]
+                    all_factors[factor] = pd.DataFrame([series.values], columns=series.index)
             else:
-                # 未映射的因子返回空
-                all_factors[factor] = pd.Series(dtype=float)
+                # 未映射的因子返回空DataFrame
+                all_factors[factor] = pd.DataFrame()
 
         return all_factors
     except Exception:
-        return {f: pd.Series(dtype=float) for f in (factor_list if isinstance(factor_list, list) else [factor_list])}
+        return {f: pd.DataFrame() for f in (factor_list if isinstance(factor_list, list) else [factor_list])}
 '''
 
 # ============================================================================
@@ -499,8 +525,8 @@ def get_injection_code(required_functions, tushare_token=''):
     if not parts:
         return ''
 
-    # 添加 tushare 初始化
-    init_code = _TUSHARE_FUNCTIONS % {'tushare_token': tushare_token}
+    # 添加 tushare 初始化（token从环境变量读取，不硬编码）
+    init_code = _TUSHARE_FUNCTIONS
 
     header = '# ======================================================================\n'
     header += '# 以下函数替代聚宽 API（基于 Tushare 实现，PTrade 已预装 tushare）\n'
