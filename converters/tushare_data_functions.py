@@ -37,13 +37,11 @@ def _ts_code_convert(jq_code):
     return jq_code
 
 def _jq_code_convert(ts_code):
-    """Tushare代码 -> 聚宽代码: 000001.SZ -> 000001.XSHE"""
+    """Tushare代码 -> PTrade代码: 000001.SZ -> 000001.SZ, 600000.SH -> 600000.SS"""
     if '.' in ts_code:
         code, suffix = ts_code.split('.')
-        if suffix == 'SZ':
-            return code + '.XSHE'
-        elif suffix == 'SH':
-            return code + '.XSHG'
+        if suffix == 'SH':
+            return code + '.SS'
     return ts_code
 
 def _batch_ts_codes(jq_codes):
@@ -259,10 +257,10 @@ def get_fundamentals_continuously(security_list, table, fields=None,
 _GET_FACTOR_VALUES = '''
 # 聚宽因子名 -> Tushare fina_indicator 字段映射
 _FACTOR_MAP = {
-    'market_cap': 'total_hldr_eqy_exc_min_int',
-    'circulating_market_cap': 'total_hldr_eqy_exc_min_int',
     'pe_ratio': None,  # 需从 daily_basic 获取
     'pb_ratio': None,  # 需从 daily_basic 获取
+    'market_cap': None,  # 从 daily_basic 获取
+    'circulating_market_cap': None,  # 从 daily_basic 获取
     'roe': 'roe',
     'roa': 'roa',
     'eps': 'eps',
@@ -276,60 +274,196 @@ _FACTOR_MAP = {
     'quick_ratio': 'quick_ratio',
     'debt_to_asset_ratio': 'debt_to_assets',
     'gross_income_ratio': 'grossprofit_margin',
-    'roe_ttm': 'roe_ttm',
+    'roe_ttm': None,  # fina_indicator无权限，改用daily_basic的pb/pe_ttm反算
     'cash_rate_of_sales': 'ocf_to_or',
 }
 
+# 财务指标季度缓存（避免每个回测天重复查询）
+_fina_indicator_cache = {}
+
 def get_factor_values(security_list, factor_list, end_date=None, count=1):
-    """替代聚宽 get_factor_values() - 获取因子数据"""
+    """替代聚宽 get_factor_values() - 批量获取因子数据"""
     import pandas as pd
     try:
-        today = end_date.strftime('%Y%m%d') if end_date else _ts_today()
-        codes = _batch_ts_codes(security_list) if security_list else []
+        today = end_date.strftime('%%Y%%m%%d') if hasattr(end_date, 'strftime') else (end_date or _ts_today())
         if isinstance(factor_list, str):
             factor_list = [factor_list]
 
+        jq_codes = set(security_list) if security_list else set()
+        ts_codes = set(_batch_ts_codes(security_list)) if security_list else set()
         all_factors = {}
 
+        # ---- 收集需要从各数据源获取的字段 ----
+        indicator_factors = {}
+        daily_basic_factors = {}
+        _DB_FIELD_MAP = {
+            'pe_ratio': 'pe', 'pb_ratio': 'pb',
+            'market_cap': 'total_mv', 'circulating_market_cap': 'circ_mv',
+            'ps_ratio': 'ps', 'turnover_ratio': 'turnover_rate',
+        }
         for factor in factor_list:
             ts_field = _FACTOR_MAP.get(factor)
-
             if ts_field:
-                # 从 fina_indicator 获取
-                dfs = []
-                for code in codes:
-                    df = _ts_pro.fina_indicator(ts_code=code, end_date=today,
-                                                 fields=f'ts_code,{ts_field}')
-                    if df is not None and not df.empty:
-                        dfs.append(df.head(count))
-                if dfs:
-                    combined = pd.concat(dfs, ignore_index=True)
-                    combined.index = _batch_jq_codes(combined['ts_code'].tolist())
-                    series = combined[ts_field]
-                    # 返回DataFrame(date_index × stock_codes)，兼容聚宽 .iloc[0] 用法
-                    all_factors[factor] = pd.DataFrame([series.values], columns=series.index)
-            elif factor in ('pe_ratio', 'pb_ratio', 'market_cap', 'circulating_market_cap',
-                            'ps_ratio', 'turnover_ratio'):
-                # 从 daily_basic 获取
-                ts_field_map = {
-                    'pe_ratio': 'pe', 'pb_ratio': 'pb',
-                    'market_cap': 'total_mv', 'circulating_market_cap': 'circ_mv',
-                    'ps_ratio': 'ps', 'turnover_ratio': 'turnover_rate',
-                }
-                ts_f = ts_field_map[factor]
-                dfs = []
-                for code in codes:
-                    df = _ts_pro.daily_basic(ts_code=code, trade_date=today,
-                                              fields=f'ts_code,{ts_f}')
-                    if df is not None and not df.empty:
-                        dfs.append(df.head(count))
-                if dfs:
-                    combined = pd.concat(dfs, ignore_index=True)
-                    combined.index = _batch_jq_codes(combined['ts_code'].tolist())
-                    series = combined[ts_f]
-                    all_factors[factor] = pd.DataFrame([series.values], columns=series.index)
-            else:
-                # 未映射的因子返回空DataFrame
+                indicator_factors[factor] = ts_field
+            elif factor in _DB_FIELD_MAP:
+                daily_basic_factors[factor] = _DB_FIELD_MAP[factor]
+
+        # ---- 批量获取 fina_indicator（多策略组合 + 季度缓存） ----
+        if indicator_factors:
+            ind_fields = ','.join(set(indicator_factors.values()))
+            try:
+                today_val = int(today) if isinstance(today, str) and today.isdigit() else int(_ts_today())
+                year = today_val // 10000
+                cache_key = f'{year}_{ind_fields}'
+
+                if cache_key not in _fina_indicator_cache:
+                    all_ind_dfs = []
+                    from datetime import datetime as _dt, timedelta as _td
+
+                    # 方法1: period 批量查询（4个季度，不break，累积覆盖）
+                    periods = [f'{year-1}1231', f'{year}0331',
+                               f'{year-1}0930', f'{year-1}0630']
+                    for period in periods:
+                        try:
+                            batch_df = _ts_pro.fina_indicator(
+                                period=period,
+                                fields=f'ts_code,{ind_fields}')
+                            if batch_df is not None and not batch_df.empty:
+                                all_ind_dfs.append(batch_df)
+                        except Exception:
+                            continue
+
+                    # 方法2: start_date/end_date 范围查询（单次调用，覆盖180天公告）
+                    try:
+                        today_dt = _dt.strptime(str(today_val), '%Y%m%d')
+                        start = (today_dt - _td(days=180)).strftime('%Y%m%d')
+                        range_df = _ts_pro.fina_indicator(
+                            start_date=start,
+                            end_date=str(today_val),
+                            fields=f'ts_code,{ind_fields}')
+                        if range_df is not None and not range_df.empty:
+                            all_ind_dfs.append(range_df)
+                    except Exception:
+                        pass
+
+                    # 方法3: 逐只查询（batch全部失败且股票数<=600时自动降级）
+                    if not all_ind_dfs and len(ts_codes) <= 600:
+                        import time as _time
+                        tc_list = list(ts_codes)[:600]
+                        success_set = set()
+                        consec_fail = 0
+                        for i, tc in enumerate(tc_list):
+                            # 连续失败5次 → 暂停2秒等限频窗口重置
+                            if consec_fail >= 5:
+                                _time.sleep(2)
+                                consec_fail = 0
+                            try:
+                                row = _ts_pro.fina_indicator(ts_code=tc, fields=f'ts_code,{ind_fields}')
+                                if row is not None and not row.empty:
+                                    all_ind_dfs.append(row.head(1))
+                                    success_set.add(tc)
+                                    consec_fail = 0
+                                else:
+                                    consec_fail += 1
+                            except Exception:
+                                consec_fail += 1
+                            _time.sleep(0.05)
+                        # 第二轮：重试失败的（0.2s延时）
+                        failed = [tc for tc in tc_list if tc not in success_set]
+                        if failed:
+                            consec_fail = 0
+                            for tc in failed:
+                                if consec_fail >= 3:
+                                    _time.sleep(2)
+                                    consec_fail = 0
+                                try:
+                                    row = _ts_pro.fina_indicator(ts_code=tc, fields=f'ts_code,{ind_fields}')
+                                    if row is not None and not row.empty:
+                                        all_ind_dfs.append(row.head(1))
+                                        success_set.add(tc)
+                                        consec_fail = 0
+                                    else:
+                                        consec_fail += 1
+                                except Exception:
+                                    consec_fail += 1
+                                _time.sleep(0.2)
+
+                    if all_ind_dfs:
+                        merged = pd.concat(all_ind_dfs, ignore_index=True)
+                        merged = merged.drop_duplicates(subset='ts_code', keep='first')
+                        _fina_indicator_cache[cache_key] = merged
+                    else:
+                        _fina_indicator_cache[cache_key] = pd.DataFrame()
+
+                ind_df = _fina_indicator_cache[cache_key]
+
+                if ind_df is not None and not ind_df.empty:
+                    ind_df = ind_df[ind_df['ts_code'].isin(ts_codes)]
+                    jq_idx = _batch_jq_codes(ind_df['ts_code'].tolist())
+                    ind_df.index = jq_idx
+                    ind_df = ind_df[ind_df.index.isin(jq_codes)]
+                    for factor, ts_field in indicator_factors.items():
+                        if ts_field in ind_df.columns:
+                            sub = ind_df[ind_df[ts_field].notna()]
+                            if not sub.empty:
+                                series = sub[ts_field]
+                                all_factors[factor] = pd.DataFrame([series.values], columns=series.index)
+                            else:
+                                all_factors[factor] = pd.DataFrame()
+                        else:
+                            all_factors[factor] = pd.DataFrame()
+                else:
+                    for factor in indicator_factors:
+                        all_factors[factor] = pd.DataFrame()
+            except Exception:
+                for factor in indicator_factors:
+                    all_factors[factor] = pd.DataFrame()
+
+        # ---- 批量获取 daily_basic（一次API调用获取所有股票） ----
+        if daily_basic_factors:
+            db_fields = ','.join(set(daily_basic_factors.values()))
+            try:
+                db_df = _ts_pro.daily_basic(trade_date=today,
+                                            fields=f'ts_code,{db_fields}')
+                if db_df is not None and not db_df.empty:
+                    db_df = db_df[db_df['ts_code'].isin(ts_codes)]
+                    jq_idx = _batch_jq_codes(db_df['ts_code'].tolist())
+                    db_df.index = jq_idx
+                    db_df = db_df[db_df.index.isin(jq_codes)]
+                    for factor, ts_field in daily_basic_factors.items():
+                        if ts_field in db_df.columns:
+                            series = db_df[ts_field]
+                            all_factors[factor] = pd.DataFrame([series.values], columns=series.index)
+                        else:
+                            all_factors[factor] = pd.DataFrame()
+                else:
+                    for factor in daily_basic_factors:
+                        all_factors[factor] = pd.DataFrame()
+            except Exception:
+                for factor in daily_basic_factors:
+                    all_factors[factor] = pd.DataFrame()
+
+        # ---- roe_ttm 反算：ROE ≈ PB / PE_TTM（daily_basic有权限） ----
+        if 'roe_ttm' in factor_list and 'roe_ttm' not in all_factors:
+            try:
+                db_roe = _ts_pro.daily_basic(trade_date=today, fields='ts_code,pe_ttm,pb')
+                if db_roe is not None and not db_roe.empty:
+                    db_roe = db_roe[db_roe['ts_code'].isin(ts_codes)]
+                    db_roe = db_roe[(db_roe['pe_ttm'] > 0) & (db_roe['pb'] > 0)]
+                    if not db_roe.empty:
+                        db_roe['roe_calc'] = db_roe['pb'] / db_roe['pe_ttm']
+                        jq_idx = _batch_jq_codes(db_roe['ts_code'].tolist())
+                        db_roe.index = jq_idx
+                        db_roe = db_roe[db_roe.index.isin(jq_codes)]
+                        series = db_roe['roe_calc']
+                        if not series.empty:
+                            all_factors['roe_ttm'] = pd.DataFrame([series.values], columns=series.index)
+            except Exception:
+                pass
+
+        # ---- 未映射的因子 ----
+        for factor in factor_list:
+            if factor not in all_factors:
                 all_factors[factor] = pd.DataFrame()
 
         return all_factors

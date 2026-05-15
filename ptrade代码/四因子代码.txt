@@ -10,6 +10,9 @@ import tushare as ts
 ts.set_token('test_token')
 _ts_pro = ts.pro_api()
 
+# 财务指标季度缓存（避免每个回测天重复查询）
+_fina_indicator_cache = {}
+
 def _ts_today():
     """获取当前日期字符串 YYYYMMDD"""
     import datetime
@@ -26,13 +29,11 @@ def _ts_code_convert(jq_code):
     return jq_code
 
 def _jq_code_convert(ts_code):
-    """Tushare代码 -> 聚宽代码: 000001.SZ -> 000001.XSHE"""
+    """Tushare代码 -> PTrade代码: 000001.SZ -> 000001.SZ, 600000.SH -> 600000.SS"""
     if '.' in ts_code:
         code, suffix = ts_code.split('.')
-        if suffix == 'SZ':
-            return code + '.XSHE'
-        elif suffix == 'SH':
-            return code + '.XSHG'
+        if suffix == 'SH':
+            return code + '.SS'
     return ts_code
 
 def _batch_ts_codes(jq_codes):
@@ -155,10 +156,10 @@ def get_industry(security=None, date=None):
 
 # 聚宽因子名 -> Tushare fina_indicator 字段映射
 _FACTOR_MAP = {
-    'market_cap': 'total_hldr_eqy_exc_min_int',
-    'circulating_market_cap': 'total_hldr_eqy_exc_min_int',
     'pe_ratio': None,  # 需从 daily_basic 获取
     'pb_ratio': None,  # 需从 daily_basic 获取
+    'market_cap': None,  # 从 daily_basic 获取
+    'circulating_market_cap': None,  # 从 daily_basic 获取
     'roe': 'roe',
     'roa': 'roa',
     'eps': 'eps',
@@ -166,66 +167,230 @@ _FACTOR_MAP = {
     'inc_net_profit_year_on_year': 'netprofit_yoy',
     'operating_revenue_grow_rate': 'or_yoy',
     'net_profit_growth_rate': 'netprofit_yoy',
-    'total_profit_growth_rate': 'profit_dedt_yoy',
+    'total_profit_growth_type': 'profit_dedt_yoy',
     'sales_growth': 'or_yoy',
     'current_ratio': 'current_ratio',
     'quick_ratio': 'quick_ratio',
     'debt_to_asset_ratio': 'debt_to_assets',
     'gross_income_ratio': 'grossprofit_margin',
-    'roe_ttm': 'roe_ttm',
+    'roe_ttm': None,  # fina_indicator无权限，改用daily_basic的pb/pe_ttm反算
     'cash_rate_of_sales': 'ocf_to_or',
 }
 
 def get_factor_values(security_list, factor_list, end_date=None, count=1):
-    """替代聚宽 get_factor_values() - 获取因子数据"""
+    """替代聚宽 get_factor_values() - 批量获取因子数据"""
     import pandas as pd
     try:
-        today = end_date.strftime('%Y%m%d') if end_date else _ts_today()
-        codes = _batch_ts_codes(security_list) if security_list else []
+        today = end_date.strftime('%Y%m%d') if hasattr(end_date, 'strftime') else (end_date or _ts_today())
         if isinstance(factor_list, str):
             factor_list = [factor_list]
 
+        jq_codes = set(security_list) if security_list else set()
+        ts_codes = set(_batch_ts_codes(security_list)) if security_list else set()
         all_factors = {}
+
+        # ---- 收集需要从各数据源获取的字段 ----
+        indicator_factors = {}  # factor -> ts_field
+        daily_basic_factors = {}  # factor -> ts_field
+        _DB_FIELD_MAP = {
+            'pe_ratio': 'pe', 'pb_ratio': 'pb',
+            'market_cap': 'total_mv', 'circulating_market_cap': 'circ_mv',
+            'ps_ratio': 'ps', 'turnover_ratio': 'turnover_rate',
+        }
 
         for factor in factor_list:
             ts_field = _FACTOR_MAP.get(factor)
-
             if ts_field:
-                # 从 fina_indicator 获取
-                dfs = []
-                for code in codes:
-                    df = _ts_pro.fina_indicator(ts_code=code, end_date=today,
-                                                 fields=f'ts_code,{ts_field}')
-                    if df is not None and not df.empty:
-                        dfs.append(df.head(count))
-                if dfs:
-                    combined = pd.concat(dfs, ignore_index=True)
-                    combined.index = _batch_jq_codes(combined['ts_code'].tolist())
-                    series = combined[ts_field]
-                    # 返回DataFrame(date_index × stock_codes)，兼容聚宽 .iloc[0] 用法
-                    all_factors[factor] = pd.DataFrame([series.values], columns=series.index)
-            elif factor in ('pe_ratio', 'pb_ratio', 'market_cap', 'circulating_market_cap',
-                            'ps_ratio', 'turnover_ratio'):
-                # 从 daily_basic 获取
-                ts_field_map = {
-                    'pe_ratio': 'pe', 'pb_ratio': 'pb',
-                    'market_cap': 'total_mv', 'circulating_market_cap': 'circ_mv',
-                    'ps_ratio': 'ps', 'turnover_ratio': 'turnover_rate',
-                }
-                ts_f = ts_field_map[factor]
-                dfs = []
-                for code in codes:
-                    df = _ts_pro.daily_basic(ts_code=code, trade_date=today,
-                                              fields=f'ts_code,{ts_f}')
-                    if df is not None and not df.empty:
-                        dfs.append(df.head(count))
-                if dfs:
-                    combined = pd.concat(dfs, ignore_index=True)
-                    combined.index = _batch_jq_codes(combined['ts_code'].tolist())
-                    series = combined[ts_f]
-                    all_factors[factor] = pd.DataFrame([series.values], columns=series.index)
-            else:
-                # 未映射的因子返回空DataFrame
+                indicator_factors[factor] = ts_field
+            elif factor in _DB_FIELD_MAP:
+                daily_basic_factors[factor] = _DB_FIELD_MAP[factor]
+
+        # ---- 批量获取 fina_indicator（多策略组合 + 季度缓存） ----
+        if indicator_factors:
+            ind_fields = ','.join(set(indicator_factors.values()))
+            try:
+                today_val = int(today) if isinstance(today, str) and today.isdigit() else int(_ts_today())
+                year = today_val // 10000
+                cache_key = '%d_%s' % (year, ind_fields)
+
+                if cache_key not in _fina_indicator_cache:
+                    all_ind_dfs = []
+                    from datetime import datetime as _dt, timedelta as _td
+
+                    # 方法1: period 批量查询（4个季度，不break，累积覆盖）
+                    periods = ['%d1231' % (year - 1), '%d0331' % year,
+                               '%d0930' % (year - 1), '%d0630' % (year - 1)]
+                    for period in periods:
+                        try:
+                            batch_df = _ts_pro.fina_indicator(
+                                period=period,
+                                fields=f'ts_code,{ind_fields}')
+                            if batch_df is not None and not batch_df.empty:
+                                all_ind_dfs.append(batch_df)
+                                log.info("【因子-fina】period=%s: %d条" % (period, len(batch_df)))
+                        except Exception as e:
+                            log.info("【因子-fina】period=%s失败: %s" % (period, e))
+
+                    # 方法2: start_date/end_date 范围查询（单次调用，覆盖180天公告）
+                    try:
+                        today_dt = _dt.strptime(str(today_val), '%Y%m%d')
+                        start = (today_dt - _td(days=180)).strftime('%Y%m%d')
+                        range_df = _ts_pro.fina_indicator(
+                            start_date=start,
+                            end_date=str(today_val),
+                            fields=f'ts_code,{ind_fields}')
+                        if range_df is not None and not range_df.empty:
+                            all_ind_dfs.append(range_df)
+                            log.info("【因子-fina】日期范围(%s~%s): %d条" % (start, today_val, len(range_df)))
+                    except Exception as e:
+                        log.info("【因子-fina】日期范围查询失败: %s" % e)
+
+                    # 方法3: 逐只查询（batch全部失败且股票数<=600时自动降级）
+                    if not all_ind_dfs and len(ts_codes) <= 600:
+                        import time as _time
+                        tc_list = list(ts_codes)[:600]
+                        log.info("【因子-fina】batch失败，逐只查询 %d 只（动态限频+失败重试）..." % len(tc_list))
+                        success_set = set()
+                        consec_fail = 0
+                        for i, tc in enumerate(tc_list):
+                            # 连续失败5次 → 暂停2秒等限频窗口重置
+                            if consec_fail >= 5:
+                                log.info("【因子-fina】连续%d次失败，暂停2s..." % consec_fail)
+                                _time.sleep(2)
+                                consec_fail = 0
+                            try:
+                                row = _ts_pro.fina_indicator(ts_code=tc, fields=f'ts_code,{ind_fields}')
+                                if row is not None and not row.empty:
+                                    all_ind_dfs.append(row.head(1))
+                                    success_set.add(tc)
+                                    consec_fail = 0
+                                else:
+                                    consec_fail += 1
+                            except Exception:
+                                consec_fail += 1
+                            _time.sleep(0.05)
+                            if (i + 1) % 100 == 0:
+                                log.info("【因子-fina】进度 %d/%d, 成功 %d" % (i + 1, len(tc_list), len(success_set)))
+                        # 第二轮：重试失败的（0.2s延时）
+                        failed = [tc for tc in tc_list if tc not in success_set]
+                        if failed:
+                            log.info("【因子-fina】重试 %d 只失败股票..." % len(failed))
+                            consec_fail = 0
+                            for tc in failed:
+                                if consec_fail >= 3:
+                                    _time.sleep(2)
+                                    consec_fail = 0
+                                try:
+                                    row = _ts_pro.fina_indicator(ts_code=tc, fields=f'ts_code,{ind_fields}')
+                                    if row is not None and not row.empty:
+                                        all_ind_dfs.append(row.head(1))
+                                        success_set.add(tc)
+                                        consec_fail = 0
+                                    else:
+                                        consec_fail += 1
+                                except Exception:
+                                    consec_fail += 1
+                                _time.sleep(0.2)
+                        log.info("【因子-fina】逐只查询成功 %d/%d" % (len(success_set), len(tc_list)))
+                        still_failed = [tc for tc in tc_list if tc not in success_set]
+                        if still_failed:
+                            log.info("【因子-fina】无数据股票(%d只): %s" % (len(still_failed), ','.join(still_failed[:50])))
+
+                    if all_ind_dfs:
+                        merged = pd.concat(all_ind_dfs, ignore_index=True)
+                        before_dedup = len(merged)
+                        merged = merged.drop_duplicates(subset='ts_code', keep='first')
+                        log.info("【因子-fina】合计%d条, 去重后%d条" % (before_dedup, len(merged)))
+                        _fina_indicator_cache[cache_key] = merged
+                    else:
+                        log.info("【因子-fina】所有方法均无数据！")
+                        _fina_indicator_cache[cache_key] = pd.DataFrame()
+
+                ind_df = _fina_indicator_cache[cache_key]
+
+                if ind_df is not None and not ind_df.empty:
+                    ind_df = ind_df[ind_df['ts_code'].isin(ts_codes)]
+                    log.info("【因子-fina】候选股匹配后: %d 行, 列=%s" % (len(ind_df), ind_df.columns.tolist()))
+                    jq_idx = _batch_jq_codes(ind_df['ts_code'].tolist())
+                    ind_df.index = jq_idx
+                    ind_df = ind_df[ind_df.index.isin(jq_codes)]
+                    log.info("【因子-fina】jq_codes匹配后: %d 行" % len(ind_df))
+                    for factor, ts_field in indicator_factors.items():
+                        if ts_field in ind_df.columns:
+                            sub = ind_df[ind_df[ts_field].notna()]
+                            if not sub.empty:
+                                series = sub[ts_field]
+                                all_factors[factor] = pd.DataFrame([series.values], columns=series.index)
+                                log.info("【因子-fina】%s(%s): %d只股票有数据" % (factor, ts_field, len(series)))
+                            else:
+                                all_factors[factor] = pd.DataFrame()
+                                log.info("【因子-fina】%s(%s): 有效值为空" % (factor, ts_field))
+                        else:
+                            all_factors[factor] = pd.DataFrame()
+                            log.info("【因子-fina】%s: 字段%s不在列中" % (factor, ts_field))
+                else:
+                    log.info("【因子-fina】ind_df为空，所有indicator因子无数据")
+                    for factor in indicator_factors:
+                        all_factors[factor] = pd.DataFrame()
+            except Exception:
+                for factor in indicator_factors:
+                    all_factors[factor] = pd.DataFrame()
+
+        # ---- 批量获取 daily_basic（一次API调用获取所有股票） ----
+        if daily_basic_factors:
+            db_fields = ','.join(set(daily_basic_factors.values()))
+            try:
+                db_df = _ts_pro.daily_basic(trade_date=today,
+                                            fields=f'ts_code,{db_fields}')
+                if db_df is not None and not db_df.empty:
+                    db_df = db_df[db_df['ts_code'].isin(ts_codes)]
+                    jq_idx = _batch_jq_codes(db_df['ts_code'].tolist())
+                    db_df.index = jq_idx
+                    db_df = db_df[db_df.index.isin(jq_codes)]
+                    for factor, ts_field in daily_basic_factors.items():
+                        if ts_field in db_df.columns:
+                            series = db_df[ts_field]
+                            all_factors[factor] = pd.DataFrame([series.values], columns=series.index)
+                        else:
+                            all_factors[factor] = pd.DataFrame()
+                else:
+                    for factor in daily_basic_factors:
+                        all_factors[factor] = pd.DataFrame()
+            except Exception:
+                for factor in daily_basic_factors:
+                    all_factors[factor] = pd.DataFrame()
+
+        # ---- roe_ttm 反算：ROE ≈ PB / PE_TTM（daily_basic有权限） ----
+        if 'roe_ttm' in factor_list and 'roe_ttm' not in all_factors:
+            try:
+                log.info("【因子-roe_ttm】开始从daily_basic反算...")
+                db_roe = _ts_pro.daily_basic(trade_date=today, fields='ts_code,pe_ttm,pb')
+                log.info("【因子-roe_ttm】daily_basic返回 %d 行" % (len(db_roe) if db_roe is not None else 0))
+                if db_roe is not None and not db_roe.empty:
+                    db_roe = db_roe[db_roe['ts_code'].isin(ts_codes)]
+                    log.info("【因子-roe_ttm】筛选候选股后: %d 行" % len(db_roe))
+                    db_roe = db_roe[(db_roe['pe_ttm'] > 0) & (db_roe['pb'] > 0)]
+                    log.info("【因子-roe_ttm】pe_ttm>0且pb>0: %d 行" % len(db_roe))
+                    if not db_roe.empty:
+                        db_roe['roe_calc'] = db_roe['pb'] / db_roe['pe_ttm']
+                        jq_idx = _batch_jq_codes(db_roe['ts_code'].tolist())
+                        db_roe.index = jq_idx
+                        db_roe = db_roe[db_roe.index.isin(jq_codes)]
+                        log.info("【因子-roe_ttm】最终 %d 只股票有roe_ttm数据" % len(db_roe))
+                        series = db_roe['roe_calc']
+                        if not series.empty:
+                            all_factors['roe_ttm'] = pd.DataFrame([series.values], columns=series.index)
+                            log.info("【因子-roe_ttm】成功! 范围: %.4f ~ %.4f" % (series.min(), series.max()))
+                        else:
+                            log.info("【因子-roe_ttm】series为空，jq_codes匹配失败？")
+                    else:
+                        log.info("【因子-roe_ttm】pe_ttm>0且pb>0筛选后为空")
+            except Exception as e:
+                log.info("【因子-roe_ttm】异常: %s" % e)
+
+        # ---- 未映射的因子 ----
+        for factor in factor_list:
+            if factor not in all_factors:
                 all_factors[factor] = pd.DataFrame()
 
         return all_factors
@@ -368,6 +533,17 @@ def initialize(context):
     """
     策略初始化函数，仅在回测/模拟启动时执行一次
     """
+    # ========== fina_indicator API 诊断 ==========
+    try:
+        _diag = _ts_pro.fina_indicator(ts_code='000001.SZ', fields='ts_code,roe_ttm,ocf_to_or')
+        if _diag is not None and not _diag.empty:
+            log.info("【诊断】fina_indicator正常，行数=%d，列=%s" % (len(_diag), _diag.columns.tolist()))
+            log.info("【诊断】样本: %s" % str(_diag.head()))
+        else:
+            log.info("【诊断】fina_indicator返回空！tushare账户可能无此接口权限")
+    except Exception as _e:
+        log.info("【诊断】fina_indicator报错: %s" % _e)
+
     # ========== 基准与复权设置 ==========
     # 以中证1000指数作为业绩基准
     set_benchmark('000852.XSHG')
@@ -448,41 +624,70 @@ def get_stock_list(context):
         log.warning("【选股】基础股票池为空，无法继续！")
         return [], [], pd.DataFrame()
 
-    # ---- 2. 获取因子数据 ----
-    FACTOR_LIST = ['roe_ttm', 'market_cap', 'cash_rate_of_sales']
+    # ---- 2. 两步因子筛选（fina_indicator需ts_code，只对预筛后股票逐只查询） ----
+
+    # 步骤A: 获取快速因子（daily_basic批量，秒级完成）
+    FAST_FACTORS = ['roe_ttm', 'market_cap']
     try:
-        factor_data = get_factor_values(initial_list, FACTOR_LIST,
+        factor_data = get_factor_values(initial_list, FAST_FACTORS,
                                         end_date=yesterday.strftime('%Y%m%d'), count=1)
-        log.info("【选股-步骤6】因子数据获取成功 (%s)" % ', '.join(FACTOR_LIST))
+        log.info("【选股-步骤6a】快速因子获取成功 (%s)" % ', '.join(FAST_FACTORS))
     except Exception as e:
-        log.error("【选股】获取因子数据失败: %s" % e)
+        log.error("【选股】获取快速因子失败: %s" % e)
         return initial_list, [], pd.DataFrame()
 
-    # 构建 DataFrame
     df = pd.DataFrame(index=initial_list)
-    for f in FACTOR_LIST:
+    for f in FAST_FACTORS:
         try:
             df[f] = factor_data[f].iloc[0]
         except Exception as e:
             log.error("【选股】因子 %s 赋值失败: %s" % (f, e))
-            continue
 
-    # 获取前收盘价作为股价因子
+    # 获取前收盘价
     try:
         price_df = get_price(initial_list, end_date=yesterday.strftime('%Y%m%d'), count=1,
                              fields=['close'])
         if price_df is not None and not price_df.empty:
             price_dict = price_df.set_index('code')['close'].to_dict()
             df['close'] = df.index.map(lambda x: price_dict.get(x, np.nan))
-        log.info("【选股-步骤7】股价数据获取完成")
+        log.info("【选股-步骤6b】股价数据获取完成")
     except Exception as e:
         log.error("【选股】获取股价失败: %s" % e)
         df['close'] = np.nan
 
-    # 删除缺失值
+    # 步骤B: 用3个快速因子预筛选到~500只
+    df_fast = df.dropna(subset=['roe_ttm', 'market_cap', 'close'])
+    if df_fast.empty:
+        log.warning("【选股】快速因子全部缺失！")
+        return initial_list, [], pd.DataFrame()
+    quick_score = (
+        df_fast['roe_ttm'].rank(ascending=False) * 0.25 +
+        df_fast['market_cap'].rank(ascending=True) * 0.35 +
+        df_fast['close'].rank(ascending=True) * 0.40
+    )
+    pre_n = min(500, len(df_fast))
+    pre_filtered = quick_score.nsmallest(pre_n).index.tolist()
+    log.info("【选股-步骤6c】快速预筛: %d -> %d 只（逐只获取现金流因子）" % (len(df_fast), pre_n))
+
+    # 步骤C: 对预筛股票逐只查询 cash_rate_of_sales
+    try:
+        slow_data = get_factor_values(pre_filtered, ['cash_rate_of_sales'],
+                                       end_date=yesterday.strftime('%Y%m%d'), count=1)
+        try:
+            cash_series = slow_data['cash_rate_of_sales'].iloc[0]
+            for code in cash_series.index:
+                if code in df.index:
+                    df.loc[code, 'cash_rate_of_sales'] = cash_series[code]
+            log.info("【选股-步骤6d】现金流因子完成，有数据: %d 只" % len(cash_series))
+        except Exception as e:
+            log.error("【选股】cash_rate_of_sales赋值失败: %s" % e)
+    except Exception as e:
+        log.error("【选股】获取现金流因子失败: %s" % e)
+
+    # 删除缺失值（只保留4因子齐全的股票）
     before_drop = len(df)
     df = df.dropna()
-    log.info("【选股-步骤8】去除因子缺失值后: %d -> %d" % (before_drop, len(df)))
+    log.info("【选股-步骤7】去除因子缺失值后: %d -> %d" % (before_drop, len(df)))
 
     if df.empty:
         log.warning("【选股】所有股票均存在缺失因子！")
@@ -516,13 +721,13 @@ def get_stock_list(context):
     # 计算总分
     rank_cols = [c for c in rank_df.columns if c.endswith('_rank')]
     rank_df['total_score'] = rank_df[rank_cols].sum(axis=1)
-    log.info("【选股-步骤9】四因子加权排名完成，总分范围: %.2f ~ %.2f" %
+    log.info("【选股-步骤8】四因子加权排名完成，总分范围: %.2f ~ %.2f" %
              (rank_df['total_score'].min(), rank_df['total_score'].max()))
 
     # 取前10%
     top_n = max(1, int(len(rank_df) * 0.1))
     top_stocks = rank_df.nsmallest(top_n, 'total_score').index.tolist()
-    log.info("【选股-步骤10】前10%%股票: %d 只" % len(top_stocks))
+    log.info("【选股-步骤9】前10%%股票: %d 只" % len(top_stocks))
 
     # ---- 4. 按流通市值排序 ----
     try:
@@ -557,11 +762,11 @@ def get_stock_list(context):
 
     # 过滤低价股
     target_list = filter_price_too_low(context, target_list)
-    log.info("【选股-步骤11】过滤低价股后: %d" % len(target_list))
+    log.info("【选股-步骤10】过滤低价股后: %d" % len(target_list))
 
     # 限制候选池数量
     target_list = target_list[:context.candidate_num]
-    log.info("【选股-步骤12】最终候选池数量: %d (上限 %d)" % (len(target_list), context.candidate_num))
+    log.info("【选股-步骤11】最终候选池数量: %d (上限 %d)" % (len(target_list), context.candidate_num))
 
     return initial_list, target_list, rank_df
 
@@ -664,7 +869,7 @@ def daily_adjustment(context):
     log.info("【调仓-买入】当前 %d，目标 %d，需买入 %d" % (position_count, target_num, need_buy))
 
     if need_buy > 0:
-        avg_value = context.portfolio.available_cash / need_buy
+        avg_value = context.portfolio.cash / need_buy
         log.info("【调仓-买入】每只计划买入 %.2f 元" % avg_value)
 
         affordable = [s for s in target_list if s not in holdings
@@ -674,7 +879,7 @@ def daily_adjustment(context):
             need_buy = target_num - position_count
             if need_buy <= 0:
                 break
-            avg_value = context.portfolio.available_cash / need_buy
+            avg_value = context.portfolio.cash / need_buy
             affordable = [s for s in target_list if s not in holdings
                           and avg_value >= current_data[s].last_price * 100]
             log.info("【调仓-买入】调整目标至 %d，可买 %d 只" % (target_num, len(affordable)))
