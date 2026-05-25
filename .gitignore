@@ -8,7 +8,7 @@ __pycache__/
 dist/
 build/
 
-# 下载数据
+# MiniPTrade 数据目录（本地生成，不提交）
 ptrade_local/data/
 
 # PTrade策略代码
@@ -19,6 +19,3 @@ ptrade代码/
 
 # API文档（仅本地参考）
 api_docs/
-
-# PTrade本地回测模块（仅本地使用）
-ptrade_local/
