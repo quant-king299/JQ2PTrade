@@ -11,6 +11,11 @@ build/
 # MiniPTrade 数据目录（本地生成，不提交）
 ptrade_local/data/
 
+# MiniPTrade 本地辅助脚本（个人环境专用）
+ptrade_local/download_*.py
+ptrade_local/export_*.py
+ptrade_local/quick_*.py
+
 # PTrade策略代码
 ptrade代码/
 
