@@ -15,6 +15,17 @@ ptrade_local/data/
 ptrade_local/download_*.py
 ptrade_local/export_*.py
 ptrade_local/quick_*.py
+!ptrade_local/download_index_data.py
+
+# MiniPTrade 策略库：默认全部不上传（白名单制）
+# 仅放行下方显式列出的 5 个基础教学策略 + README
+ptrade_local/strategies/*
+!ptrade_local/strategies/README.md
+!ptrade_local/strategies/ma_cross_demo.py
+!ptrade_local/strategies/etf_ma_strategy.py
+!ptrade_local/strategies/rsi_strategy.py
+!ptrade_local/strategies/sw_momentum_strategy.py
+!ptrade_local/strategies/五合一打板策略.py
 
 # PTrade策略代码
 ptrade代码/

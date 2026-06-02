@@ -75,13 +75,35 @@ def create_api_namespace(
     _trade_id_counter = [0]
     _benchmark_code = ['000300.SS']
     _slippage = [0.0]
-    _commission_rate = [0.0003]
+    # 佣金组件（与 PTrade set_commission 关键字参数对齐）
+    _commission_rate = [0.0003]       # 佣金费率（万3 默认）
+    _min_commission = [5.0]           # 最低佣金（元）
+    _stamp_duty_rate = [0.001]        # 印花税（仅卖出，千1）
+    _transfer_fee_rate = [0.00001]    # 过户费（万0.1）
 
     def _current_dt() -> pd.Timestamp:
         return context.current_dt
 
     # ------------------------------------------------------------------
-    # 内部: 执行一笔交易
+    # 内部: 计算手续费（佣金+印花税+过户费），与 PTrade 规则一致
+    # ------------------------------------------------------------------
+    def _calc_fees(turnover: float, direction: str) -> tuple[float, float, float, float]:
+        """
+        返回 (total_fee, commission, stamp_duty, transfer_fee)
+        - turnover: 成交金额
+        - direction: 'BUY' / 'SELL'
+        - 佣金: max(min_commission, turnover * commission_rate)
+        - 印花税: 卖出千1，买入0
+        - 过户费: 双向万0.1
+        """
+        turnover = max(0.0, float(turnover))
+        commission = max(_min_commission[0], turnover * _commission_rate[0])
+        stamp_duty = turnover * _stamp_duty_rate[0] if direction == 'SELL' else 0.0
+        transfer_fee = turnover * _transfer_fee_rate[0]
+        return commission + stamp_duty + transfer_fee, commission, stamp_duty, transfer_fee
+
+    # ------------------------------------------------------------------
+    # 内部: 执行一笔交易（按 PTrade 费用规则计费）
     # ------------------------------------------------------------------
     def _execute_trade(security: str, amount: int) -> int | None:
         if amount == 0:
@@ -100,14 +122,15 @@ def create_api_namespace(
                 return None
             shares = amount
             cost = exec_price * shares
-            commission = cost * _commission_rate[0]
-            total_cost = cost + commission
+            total_fee, commission, _, transfer_fee = _calc_fees(cost, 'BUY')
+            total_cost = cost + total_fee
             if total_cost > portfolio.cash:
                 return None
             portfolio.cash -= total_cost
             pos = portfolio.get_position(security)
             old_total = pos.amount * pos.cost_basis
             pos.amount += shares
+            # 成本价 = (旧成本 + 买入成交额) / 总股数（不含费用，与 PTrade 一致）
             pos.cost_basis = (old_total + cost) / pos.amount if pos.amount > 0 else 0.0
             pos.enable_amount = pos.amount
         else:
@@ -120,8 +143,8 @@ def create_api_namespace(
             if exec_price < bar.get('low_limit', 0):
                 return None
             revenue = exec_price * sell_shares
-            commission = revenue * _commission_rate[0]
-            portfolio.cash += revenue - commission
+            total_fee, commission, stamp_duty, transfer_fee = _calc_fees(revenue, 'SELL')
+            portfolio.cash += revenue - total_fee
             pos.amount -= sell_shares
             pos.enable_amount = pos.amount
             if pos.amount == 0:
@@ -311,8 +334,36 @@ def create_api_namespace(
     def set_slippage(value):
         _slippage[0] = float(value)
 
-    def set_commission(value):
-        _commission_rate[0] = float(value)
+    def set_commission(commission_ratio=None, min_commission=None,
+                       stamp_duty_ratio=None, transfer_fee_ratio=None,
+                       value=None):
+        """与 PTrade set_commission 完全对齐（关键字参数）
+
+        PTrade 签名: set_commission(commission_ratio, min_commission,
+                                    stamp_duty_ratio, transfer_fee_ratio)
+        旧版 MiniPTrade 兼容: set_commission(value) - 单值当作 commission_ratio
+
+        任一参数传 None 表示保持原值不变。
+        """
+        # 兼容旧式 set_commission(0.0003) 调用
+        if value is not None and commission_ratio is None:
+            commission_ratio = value
+        if commission_ratio is not None:
+            _commission_rate[0] = float(commission_ratio)
+        if min_commission is not None:
+            _min_commission[0] = float(min_commission)
+        if stamp_duty_ratio is not None:
+            _stamp_duty_rate[0] = float(stamp_duty_ratio)
+        if transfer_fee_ratio is not None:
+            _transfer_fee_rate[0] = float(transfer_fee_ratio)
+
+    def set_stamp_duty(value):
+        """单独设置印花税（PTrade 部分版本支持）"""
+        _stamp_duty_rate[0] = float(value)
+
+    def set_transfer_fee(value):
+        """单独设置过户费"""
+        _transfer_fee_rate[0] = float(value)
 
     def set_option(key, value):
         pass
@@ -360,6 +411,8 @@ def create_api_namespace(
         'set_universe': set_universe,
         'set_slippage': set_slippage,
         'set_commission': set_commission,
+        'set_stamp_duty': set_stamp_duty,
+        'set_transfer_fee': set_transfer_fee,
         'set_option': set_option,
         'set_price_limit': set_price_limit,
         # 工具

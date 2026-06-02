@@ -41,11 +41,11 @@ class DataLoader:
         con = duckdb.connect(self.duckdb_path, read_only=True)
         try:
             sql = f"""
-                SELECT stock_code, date, open, high, low, close,
+                SELECT stock_code, symbol_type, date, open, high, low, close,
                        volume, amount,
                        LAG(close) OVER (PARTITION BY stock_code ORDER BY date) as preclose
                 FROM stock_daily
-                WHERE period = '1d' AND symbol_type = 'stock'
+                WHERE period = '1d' AND symbol_type IN ('stock', 'index')
                   AND date >= '{extended_start.strftime('%Y-%m-%d')}'
                   AND date <= '{end.strftime('%Y-%m-%d')}'
                 ORDER BY stock_code, date
@@ -57,24 +57,45 @@ class DataLoader:
         if df.empty:
             raise ValueError("DuckDB 中无日线数据")
 
-        print(f"  原始记录: {len(df)} 条, {df['stock_code'].nunique()} 只股票")
+        stock_count = (df['symbol_type'] == 'stock').sum()
+        index_count = (df['symbol_type'] == 'index').sum()
+        print(f"  原始记录: {len(df)} 条 "
+              f"(股票记录 {stock_count}, 指数记录 {index_count})")
+        print(f"  代码分布: {df['stock_code'].nunique()} 只 "
+              f"({df[df['symbol_type']=='stock']['stock_code'].nunique()} 股票 / "
+              f"{df[df['symbol_type']=='index']['stock_code'].nunique()} 指数)")
 
         # preclose: 首行用 close 填充
         df['preclose'] = df['preclose'].fillna(df['close'])
-        # 涨跌停价
-        df['high_limit'] = (df['preclose'] * 1.1).round(2)
-        df['low_limit'] = (df['preclose'] * 0.9).round(2)
+        # 涨跌停价（指数不受涨跌停限制，用 ±∞ 表示）
+        is_stock = df['symbol_type'] == 'stock'
+        df['high_limit'] = np.where(is_stock,
+                                     (df['preclose'] * 1.1).round(2),
+                                     np.inf)
+        df['low_limit'] = np.where(is_stock,
+                                    (df['preclose'] * 0.9).round(2),
+                                    -np.inf)
         # .SH → .SS (PTrade 格式)
         df['stock_code'] = df['stock_code'].str.replace('.SH', '.SS', regex=False)
 
-        # 按 stock_code 预分组，存入 dict（去掉 stock_code 列）
-        data_cols = ['open', 'high', 'low', 'close', 'volume', 'amount',
-                     'preclose', 'high_limit', 'low_limit']
+        # 按 stock_code 预分组，存入 dict
+        data_cols = ['symbol_type', 'open', 'high', 'low', 'close', 'volume',
+                     'amount', 'preclose', 'high_limit', 'low_limit']
         for code, group in df.groupby('stock_code'):
             sub = group.set_index('date').sort_index()
             self._stock_data[code] = sub[[c for c in data_cols if c in sub.columns]]
 
-        self._all_codes = sorted(self._stock_data.keys())
+        self._all_codes = sorted(
+            code for code, df in self._stock_data.items()
+            if not df.empty and (df.get('symbol_type', 'stock').iloc[0] == 'stock'
+                                  if 'symbol_type' in df.columns else True)
+        )
+        # 指数代码清单（供策略/调试用）
+        self._index_codes = sorted(
+            code for code, df in self._stock_data.items()
+            if not df.empty and 'symbol_type' in df.columns
+            and df['symbol_type'].iloc[0] == 'index'
+        )
 
         # 交易日: 从全部数据中取 [start, end] 范围内的去重日期
         all_dates = sorted(df['date'].unique())
@@ -118,8 +139,21 @@ class DataLoader:
             return {'close': 0.0, 'high_limit': 999999.0,
                     'low_limit': 0.0, 'volume': 0, 'open': 0.0}
         row = sdf.loc[ts]
-        return {col: float(row[col]) if col != 'volume' else int(row[col])
-                for col in row.index}
+        # 跳过非数值字段（如 symbol_type），只返回行情字段
+        result = {}
+        for col in row.index:
+            if col == 'symbol_type':
+                continue
+            val = row[col]
+            try:
+                result[col] = int(val) if col == 'volume' else float(val)
+            except (TypeError, ValueError):
+                result[col] = val
+        return result
+
+    @property
+    def index_codes(self) -> list[str]:
+        return self._index_codes
 
     @property
     def all_codes(self) -> list[str]:
