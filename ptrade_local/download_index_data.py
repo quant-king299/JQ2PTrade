@@ -111,8 +111,6 @@ def to_duckdb_format(df: pd.DataFrame, ts_code: str) -> pd.DataFrame:
         'close': df['close'].astype(float),
         'volume': df['vol'].astype('int64'),
         'amount': df['amount'].astype(float),
-        'adjust_type': 'none',
-        'factor': 1.0,
     })
     return out
 
@@ -150,10 +148,10 @@ def write_to_duckdb(df: pd.DataFrame, duckdb_path: str, replace: bool):
             INSERT INTO stock_daily
                 (stock_code, symbol_type, date, period,
                  open, high, low, close, volume, amount,
-                 adjust_type, factor)
+                 created_at, updated_at)
             SELECT stock_code, symbol_type, date, period,
                    open, high, low, close, volume, amount,
-                   adjust_type, factor
+                   CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
             FROM _idx_df
         """)
         con.unregister('_idx_df')
