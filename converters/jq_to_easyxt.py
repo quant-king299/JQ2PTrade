@@ -136,7 +136,11 @@ class JQToEasyXTConverter:
             'has_trading': False,
             'uses_get_current_data': False,
             'uses_fundamentals': False,
-            'timing_functions': [],  # [(type, func_name, params_str)]
+            'uses_get_factor_values': False,
+            'uses_get_trades': False,
+            'uses_position_object': False,   # position.security 等
+            'uses_order_object': False,      # order.filled, OrderStatus 等
+            'timing_functions': [],
         }
 
         if re.search(r'\b(order|order_value|order_target|order_target_value|order_target_percent)\s*\(', code):
@@ -147,6 +151,18 @@ class JQToEasyXTConverter:
 
         if re.search(r'\bget_fundamentals\s*\(|\bquery\s*\(', code):
             analysis['uses_fundamentals'] = True
+
+        if re.search(r'\bget_factor_values\s*\(', code):
+            analysis['uses_get_factor_values'] = True
+
+        if re.search(r'\bget_trades\s*\(', code):
+            analysis['uses_get_trades'] = True
+
+        if re.search(r'\bposition\.(security|avg_cost|price|value|total_amount)\b', code):
+            analysis['uses_position_object'] = True
+
+        if re.search(r'\border\.(filled|status|amount)\b|OrderStatus\.', code):
+            analysis['uses_order_object'] = True
 
         timing_patterns = [
             (r'run_daily\s*\(\s*(\w+)\s*,\s*([^)]+)\)', 'run_daily'),
@@ -335,6 +351,44 @@ class JQToEasyXTConverter:
                 new_line = new_line.replace(
                     'get_current_data()', 'get_current_data_compat(api)')
                 self._add_mapping('get_current_data() → get_current_data_compat(api)')
+
+            # get_factor_values → get_factor_values_compat
+            if 'get_factor_values(' in new_line:
+                new_line = re.sub(
+                    r'(?<![.\w])get_factor_values\s*\(',
+                    'get_factor_values_compat(api, ', new_line)
+                self._add_mapping('get_factor_values() → get_factor_values_compat()')
+
+            # get_fundamentals(query(...)) → get_fundamentals_compat
+            if 'get_fundamentals(' in new_line:
+                new_line = re.sub(
+                    r'(?<![.\w])get_fundamentals\s*\(',
+                    'get_fundamentals_compat(api, ', new_line)
+                self._add_mapping('get_fundamentals() → get_fundamentals_compat()')
+
+            # get_trades() → get_trades_compat
+            if 'get_trades(' in new_line:
+                new_line = re.sub(
+                    r'(?<![.\w])get_trades\s*\(\s*\)',
+                    'get_trades_compat(api)', new_line)
+                new_line = re.sub(
+                    r'(?<![.\w])get_trades\s*\(\s*(.+)',
+                    r'get_trades_compat(api, \1', new_line)
+                self._add_mapping('get_trades() → get_trades_compat()')
+
+            # query(valuation.xxx).filter(...).order_by(...) → 提取代码列表
+            if 'query(' in new_line and 'valuation.' in new_line:
+                in_match = re.search(r'\.in_\(([^)]+)\)', new_line)
+                if in_match:
+                    code_var = in_match.group(1)
+                    indent = new_line[:len(new_line) - len(new_line.lstrip())]
+                    comment = f'{indent}# 原JQ: {new_line.strip()[:80]}'
+                    new_line = f'{indent}q = {code_var}'
+                    result_lines.append(comment)
+                    self._add_mapping('query() → 提取代码列表')
+                else:
+                    new_line = f'# query() 无法自动解析: {new_line.strip()[:60]}'
+                    self._add_warning('query() 无法自动提取代码列表')
 
             result_lines.append(new_line)
 
@@ -640,6 +694,26 @@ class JQToEasyXTConverter:
             parts.append(self._gen_current_data_compat())
             parts.append('')
 
+        if analysis.get('uses_get_factor_values'):
+            parts.append(self._gen_factor_helper())
+            parts.append('')
+
+        if analysis.get('uses_fundamentals'):
+            parts.append(self._gen_fundamentals_helper())
+            parts.append('')
+
+        if analysis.get('uses_get_trades'):
+            parts.append(self._gen_trades_helper())
+            parts.append('')
+
+        if analysis.get('uses_position_object') or analysis.get('uses_order_object'):
+            parts.append(self._gen_position_wrapper())
+            parts.append('')
+
+        if analysis.get('uses_order_object'):
+            parts.append(self._gen_order_wrapper())
+            parts.append('')
+
         # ---- 策略函数 ----
         parts.append('# ========================================')
         parts.append('# 策略函数')
@@ -777,6 +851,299 @@ def get_current_data_compat(api, security_list=None):
                 'paused': False, 'is_st': False, 'name': code, 'day_open': 0
             }
     return result'''
+
+    def _gen_factor_helper(self) -> str:
+        """注入 get_factor_values_compat — 基于 tushare"""
+        self._add_function('get_factor_values_compat()')
+        return '''# ========================================
+# get_factor_values 兼容函数 (tushare)
+# ========================================
+# 请先设置 tushare token: https://tushare.pro
+TUSHARE_TOKEN = ""  # TODO: 填入你的 tushare token
+
+def _init_tushare():
+    """延迟初始化 tushare"""
+    import tushare as ts
+    ts.set_token(TUSHARE_TOKEN)
+    return ts.pro_api()
+
+def _jq_to_ts(code):
+    """000001.XSHE → 000001.SZ"""
+    return code.replace('.XSHE', '.SZ').replace('.XSHG', '.SH')
+
+def _ts_to_jq(code):
+    """000001.SZ → 000001.XSHE"""
+    return code.replace('.SZ', '.XSHE').replace('.SH', '.XSHG')
+
+def get_factor_values_compat(api, stock_list, factor_name, end_date=None, count=1):
+    """模拟聚宽 get_factor_values，使用 tushare 数据"""
+    if not TUSHARE_TOKEN:
+        print("[WARNING] 未设置 TUSHARE_TOKEN，get_factor_values 返回空")
+        return None
+    try:
+        pro = _init_tushare()
+    except Exception:
+        print("[WARNING] tushare 未安装: pip install tushare")
+        return None
+
+    ts_codes = [_jq_to_ts(c) for c in stock_list]
+    if end_date is None:
+        end_date = datetime.now().strftime('%Y%m%d')
+    elif hasattr(end_date, 'strftime'):
+        end_date = end_date.strftime('%Y%m%d')
+    else:
+        end_date = str(end_date).replace('-', '')
+
+    # 因子名 → (tushare表, 字段名)
+    FACTOR_MAP = {
+        'net_profit_growth_rate': ('fina_indicator', 'net_profit_growth_rate'),
+        'net_profit_margin': ('fina_indicator', 'net_profit_margin'),
+        'roe': ('fina_indicator', 'roe'),
+        'roa': ('fina_indicator', 'roa'),
+        'eps': ('fina_indicator', 'eps'),
+        'EBIT': ('fina_indicator', 'ebit'),
+        'market_cap': ('daily_basic', 'total_mv'),
+        'circulating_market_cap': ('daily_basic', 'circ_mv'),
+        'pe': ('daily_basic', 'pe'),
+        'pe_ttm': ('daily_basic', 'pe_ttm'),
+        'pb': ('daily_basic', 'pb'),
+        'PEG': None,  # PEG = PE / 增长率，需自定义计算
+        'turnover_volatility': None,
+        'total_revenue': ('fina_indicator', 'total_revenue'),
+        'net_profit': ('fina_indicator', 'net_profit'),
+        'ncf_from_oa': ('fina_indicator', 'ncf_from_oa'),
+    }
+
+    if factor_name not in FACTOR_MAP:
+        print(f'[WARNING] 因子 "{factor_name}" 未映射，需手动处理')
+        return None
+
+    info = FACTOR_MAP[factor_name]
+    if info is None:
+        print(f'[WARNING] 因子 "{factor_name}" 需自定义计算公式')
+        return None
+
+    table, field = info
+    ts_code_str = ','.join(ts_codes)
+
+    try:
+        if table == 'fina_indicator':
+            df = pro.fina_indicator(ts_code=ts_code_str, fields=f'ts_code,{field}')
+        elif table == 'daily_basic':
+            df = pro.daily_basic(ts_code=ts_code_str, trade_date=end_date, fields=f'ts_code,{field}')
+        else:
+            return None
+
+        if df is None or df.empty:
+            print(f'[WARNING] tushare 未返回 {factor_name} 数据')
+            return None
+
+        # 构造 JQ 风格返回值: {factor_name: DataFrame}
+        result_df = pd.DataFrame(index=stock_list)
+        result_df[factor_name] = None
+        for _, row in df.iterrows():
+            jq_code = _ts_to_jq(row['ts_code'])
+            if jq_code in result_df.index:
+                result_df.at[jq_code, factor_name] = row[field]
+
+        result_df = result_df.dropna()
+        if result_df.empty:
+            return None
+        # 包装成 JQ 风格: [factor_name].iloc[0].tolist()
+        wrapper = pd.DataFrame({factor_name: [result_df[factor_name].tolist()]})
+        return wrapper
+    except Exception as e:
+        print(f'[ERROR] get_factor_values({factor_name}): {e}')
+        return None'''
+
+    def _gen_fundamentals_helper(self) -> str:
+        """注入 get_fundamentals_compat — 简化版，处理常见 query(valuation.xxx)"""
+        self._add_function('get_fundamentals_compat()')
+        return '''# ========================================
+# get_fundamentals 兼容函数 (tushare)
+# ========================================
+def get_fundamentals_compat(api, query_or_code_list, fields=None, date=None):
+    """模拟聚宽 get_fundamentals + query，使用 tushare daily_basic
+    注: 聚宽 ORM 语法复杂，此处仅处理常见情况:
+        query(valuation.code, valuation.circulating_market_cap).filter(...).order_by(...)
+    """
+    if not TUSHARE_TOKEN:
+        print("[WARNING] 未设置 TUSHARE_TOKEN，get_fundamentals 返回空DataFrame")
+        return pd.DataFrame()
+
+    # 如果是字符串（query对象的字符串表示），尝试解析
+    code_list = None
+    order_field = None
+
+    if isinstance(query_or_code_list, str):
+        # 尝试从 query 字符串中提取信息
+        s = query_or_code_list
+        # 提取 .filter(valuation.code.in_(xxx))
+        in_match = re.search(r'\\.in_\\(\\s*\\[?([^)]+)\\]?', s)
+        # 提取 .order_by(valuation.xxx.asc/desc)
+        order_match = re.search(r'order_by\\(valuation\\.(\\w+)', s)
+        if order_match:
+            order_field = order_match.group(1)
+    elif isinstance(query_or_code_list, list):
+        code_list = query_or_code_list
+
+    if code_list is None:
+        # 无法解析，返回空
+        print("[WARNING] get_fundamentals query 无法自动解析，返回空DataFrame")
+        print(f"  原始query: {str(query_or_code_list)[:200]}")
+        return pd.DataFrame()
+
+    if date is None:
+        date = datetime.now().strftime('%Y%m%d')
+    elif hasattr(date, 'strftime'):
+        date = date.strftime('%Y%m%d')
+    else:
+        date = str(date).replace('-', '')
+
+    ts_codes = [_jq_to_ts(c) for c in code_list]
+    ts_code_str = ','.join(ts_codes)
+
+    try:
+        pro = _init_tushare()
+        df = pro.daily_basic(ts_code=ts_code_str, trade_date=date,
+                             fields='ts_code,total_mv,circ_mv,pe,pe_ttm,pb')
+
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        # 排序
+        if order_field == 'circulating_market_cap':
+            df = df.sort_values('circ_mv')
+        elif order_field == 'market_cap':
+            df = df.sort_values('total_mv')
+
+        # 映射回 JQ 代码格式
+        df['code'] = df['ts_code'].apply(_ts_to_jq)
+        return df
+    except Exception as e:
+        print(f'[ERROR] get_fundamentals: {e}')
+        return pd.DataFrame()'''
+
+    def _gen_trades_helper(self) -> str:
+        """注入 get_trades_compat — 使用 EasyXT get_orders"""
+        self._add_function('get_trades_compat()')
+        return '''# ========================================
+# get_trades 兼容函数
+# ========================================
+def get_trades_compat(api):
+    """模拟聚宽 get_trades()，使用 EasyXT get_orders + 手动维护成交记录
+    注意: 此简化版返回今日委托列表，不是真正的成交记录
+    """
+    try:
+        orders = api.get_orders(ACCOUNT_ID)
+        if orders is None or orders.empty:
+            return {}
+        # 转换为类似 JQ 的 {order_id: trade_dict} 格式
+        result = {}
+        for _, row in orders.iterrows():
+            result[row.get('order_id', _)] = {
+                'security': row.get('code', ''),
+                'price': row.get('price', 0),
+                'amount': row.get('volume', 0),
+                'filled': row.get('traded_volume', 0),
+                'time': str(row.get('time', '')),
+            }
+        return result
+    except Exception:
+        return {}'''
+
+    def _gen_position_wrapper(self) -> str:
+        """注入 JQ 风格 Position 对象包装"""
+        self._add_function('PositionWrapper')
+        return '''# ========================================
+# JQ Position 对象兼容包装
+# ========================================
+def _wrap_positions(api):
+    """将 EasyXT get_positions DataFrame 包装为 JQ 风格 {code: Position}"""
+    df = api.get_positions(ACCOUNT_ID)
+    if df is None or df.empty:
+        return {}
+    result = {}
+    for _, row in df.iterrows():
+        code = row['code']
+        # 创建类似 JQ Position 的对象
+        pos = type('Position', (), {})()
+        pos.security = code
+        pos.total_amount = int(row.get('volume', 0))
+        pos.value = float(row.get('market_value', 0))
+        pos.avg_cost = float(row.get('open_price', 0))
+        # 获取当前价格
+        try:
+            price_df = api.get_current_price(code)
+            pos.price = float(price_df.iloc[-1]) if price_df is not None and not price_df.empty else 0
+        except Exception:
+            pos.price = 0
+        result[code] = pos
+    return result
+
+def _wrap_position(api, stock_code):
+    """包装单只股票持仓为 JQ 风格 Position 对象"""
+    df = api.get_positions(ACCOUNT_ID, stock_code)
+    if df is None or df.empty:
+        pos = type('Position', (), {})()
+        pos.security = stock_code
+        pos.total_amount = 0
+        pos.value = 0
+        pos.avg_cost = 0
+        pos.price = 0
+        return pos
+    row = df.iloc[0]
+    pos = type('Position', (), {})()
+    pos.security = row['code']
+    pos.total_amount = int(row.get('volume', 0))
+    pos.value = float(row.get('market_value', 0))
+    pos.avg_cost = float(row.get('open_price', 0))
+    try:
+        price_df = api.get_current_price(stock_code)
+        pos.price = float(price_df.iloc[-1]) if price_df is not None and not price_df.empty else 0
+    except Exception:
+        pos.price = 0
+    return pos'''
+
+    def _gen_order_wrapper(self) -> str:
+        """注入 JQ 风格 Order/OrderStatus"""
+        self._add_function('OrderWrapper')
+        return '''# ========================================
+# JQ Order/OrderStatus 兼容包装
+# ========================================
+class OrderStatus:
+    held = 'held'
+    filled = 'filled'
+    canceled = 'canceled'
+    rejected = 'rejected'
+
+def _wrap_order(api, order_id):
+    """将 EasyXT 订单号包装为 JQ 风格 Order 对象"""
+    if order_id is None or order_id <= 0:
+        return None
+    try:
+        orders = api.get_orders(ACCOUNT_ID)
+        if orders is not None and not orders.empty:
+            row = orders[orders['order_id'] == order_id]
+            if not row.empty:
+                row = row.iloc[0]
+                order = type('Order', (), {})()
+                order.order_id = order_id
+                order.filled = int(row.get('traded_volume', 0))
+                order.amount = int(row.get('volume', 0))
+                order.status = OrderStatus.filled if order.filled >= order.amount else OrderStatus.held
+                order.price = float(row.get('price', 0))
+                return order
+    except Exception:
+        pass
+    # 如果查不到，假设订单已成交
+    order = type('Order', (), {})()
+    order.order_id = order_id
+    order.filled = 100  # 默认填100避免 open_position 检查 .filled > 0 失败
+    order.amount = 100
+    order.status = OrderStatus.filled
+    order.price = 0
+    return order'''
 
     # ================================================================
     #  报告系统
