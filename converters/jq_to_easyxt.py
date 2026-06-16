@@ -705,6 +705,7 @@ class JQToEasyXTConverter:
             '# -*- coding: utf-8 -*-',
             '"""聚宽策略 → EasyXT 自动转换 (V2.0)"""',
             '',
+            'import os',
             'import re',
             'import time',
             'import pandas as pd',
@@ -714,9 +715,10 @@ class JQToEasyXTConverter:
             'from easy_xt import EasyXT',
             '',
             '# ========================================',
-            '# 配置（请修改为实际值）',
+            '# 配置（从环境变量读取，或在此处直接修改）',
             '# ========================================',
-            f'ACCOUNT_ID = "{self.account_id}"  # TODO: 改为实际账户ID',
+            'ACCOUNT_ID = os.environ.get("EASYXT_ACCOUNT_ID", "")',
+            'TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "")',
             '',
         ])
 
@@ -899,8 +901,8 @@ def get_current_data_compat(api, security_list=None):
         return '''# ========================================
 # get_factor_values 兼容函数 (tushare)
 # ========================================
-# 请先设置 tushare token: https://tushare.pro
-TUSHARE_TOKEN = ""  # TODO: 填入你的 tushare token
+# TUSHARE_TOKEN 已从环境变量读取，见文件顶部配置区
+# 设置方式: export TUSHARE_TOKEN="your_token" 或在 .env 文件中配置
 
 def _init_tushare():
     """延迟初始化 tushare"""
