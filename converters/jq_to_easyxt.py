@@ -84,6 +84,21 @@ class JQToEasyXTConverter:
         # Step 3: 提取函数体（纯文本）和全局变量
         extracted = self._extract_code_blocks(code)
 
+        # Step 3.5: 从 initialize() 提取 g.xxx 全局变量
+        if 'initialize' in extracted['functions']:
+            init_body = extracted['functions']['initialize']['body']
+            for line in init_body.split('\n'):
+                g_match = re.match(r'\s*g\.(\w+)\s*=\s*(.+)', line)
+                if g_match:
+                    var_name = g_match.group(1)
+                    var_value = g_match.group(2).strip()
+                    # 过滤掉已有重复
+                    if not any(v.startswith(f'{var_name} =') for v in extracted['global_vars']):
+                        extracted['global_vars'].append(f'{var_name} = {var_value}')
+                        self._add_mapping(f'g.{var_name} → 全局变量 (from initialize)')
+            # 移除 initialize，不生成空函数
+            del extracted['functions']['initialize']
+
         # Step 4: 对每个函数体应用转换管道
         all_func_names = set(extracted['functions'].keys())
         converted_functions = {}
@@ -108,6 +123,29 @@ class JQToEasyXTConverter:
         for func_name in converted_functions:
             converted_functions[func_name]['body'] = self._fix_func_calls(
                 converted_functions[func_name]['body'], all_func_names)
+
+        # Step 4.6: 后处理 — get_stock_list().index.tolist() → get_stock_list()
+        for func_name in converted_functions:
+            body = converted_functions[func_name]['body']
+            body = re.sub(r'api\.get_stock_list\(\)\.index\.tolist\(\)',
+                          'api.get_stock_list()', body)
+            body = re.sub(r'api\.get_stock_list\(\)\.index\b',
+                          'api.get_stock_list()', body)
+            # DataFrame 行属性访问 → _wrap_position
+            body = re.sub(
+                r'api\.get_positions\(ACCOUNT_ID\)\[(\w+)\]\.total_amount',
+                r'_wrap_position(api, \1).total_amount', body)
+            body = re.sub(
+                r'api\.get_positions\(ACCOUNT_ID\)\[(\w+)\]\.value',
+                r'_wrap_position(api, \1).value', body)
+            body = re.sub(
+                r'api\.get_positions\(ACCOUNT_ID\)\[(\w+)\]\.security',
+                r'_wrap_position(api, \1).security', body)
+            # print_trade_info 中的 position 迭代
+            body = re.sub(
+                r'for (\w+) in list\(api\.get_positions\(ACCOUNT_ID\)\.values\(\)\)',
+                r'for _, \1 in _wrap_positions(api).items()', body)
+            converted_functions[func_name]['body'] = body
 
         # Step 5: 生成最终脚本
         final_code = self._generate_script(
@@ -165,9 +203,9 @@ class JQToEasyXTConverter:
             analysis['uses_order_object'] = True
 
         timing_patterns = [
-            (r'run_daily\s*\(\s*(\w+)\s*,\s*([^)]+)\)', 'run_daily'),
-            (r'run_weekly\s*\(\s*(\w+)\s*,\s*([^)]+)\)', 'run_weekly'),
-            (r'run_monthly\s*\(\s*(\w+)\s*,\s*([^)]+)\)', 'run_monthly'),
+            (r'^[^#]*\brun_daily\s*\(\s*(\w+)\s*,\s*([^)]+)\)', 'run_daily'),
+            (r'^[^#]*\brun_weekly\s*\(\s*(\w+)\s*,\s*([^)]+)\)', 'run_weekly'),
+            (r'^[^#]*\brun_monthly\s*\(\s*(\w+)\s*,\s*([^)]+)\)', 'run_monthly'),
         ]
         for pattern, ttype in timing_patterns:
             for m in re.finditer(pattern, code):
@@ -478,7 +516,7 @@ class JQToEasyXTConverter:
         return f'{indent}{stripped}'
 
     def _conv_order_target_value(self, stripped: str, indent: str) -> str:
-        """order_target_value(security, value) → 按金额调仓"""
+        """order_target_value(security, value) → 按金额调仓，返回 Order 对象"""
         m = re.search(r'order_target_value\s*\(\s*([^,]+)\s*,\s*([^)]+)\s*\)', stripped)
         if m:
             sec, tval = m.group(1), m.group(2)
@@ -487,6 +525,7 @@ class JQToEasyXTConverter:
                     stripped.replace('order_target_value', 'order_target'), indent)
             self._add_mapping(f'order_target_value({sec}, {tval}) → 按金额调仓')
             return f"""{indent}# order_target_value({sec}, {tval}) → 按金额调仓
+{indent}_oid = None
 {indent}_price = api.get_current_price({sec})
 {indent}if _price is not None and not _price.empty:
 {indent}    _latest = float(_price.iloc[-1]) if hasattr(_price, "iloc") else float(_price)
@@ -495,9 +534,10 @@ class JQToEasyXTConverter:
 {indent}    _cur_vol = int(_pos.iloc[0]["volume"]) if _pos is not None and not _pos.empty else 0
 {indent}    _diff = _target_vol - _cur_vol
 {indent}    if _diff > 0:
-{indent}        api.buy(ACCOUNT_ID, {sec}, _diff)
+{indent}        _oid = api.buy(ACCOUNT_ID, {sec}, _diff)
 {indent}    elif _diff < 0:
-{indent}        api.sell(ACCOUNT_ID, {sec}, abs(_diff))"""
+{indent}        _oid = api.sell(ACCOUNT_ID, {sec}, abs(_diff))
+{indent}return _wrap_order(api, _oid) if _oid else None"""
         return f'{indent}{stripped}'
 
     def _conv_order_target_percent(self, stripped: str, indent: str) -> str:
@@ -665,6 +705,7 @@ class JQToEasyXTConverter:
             '# -*- coding: utf-8 -*-',
             '"""聚宽策略 → EasyXT 自动转换 (V2.0)"""',
             '',
+            'import re',
             'import time',
             'import pandas as pd',
             'import numpy as np',
@@ -1041,7 +1082,8 @@ def get_trades_compat(api):
         # 转换为类似 JQ 的 {order_id: trade_dict} 格式
         result = {}
         for _, row in orders.iterrows():
-            result[row.get('order_id', _)] = {
+            oid = row.get('order_id', len(result))
+            result[oid] = {
                 'security': row.get('code', ''),
                 'price': row.get('price', 0),
                 'amount': row.get('volume', 0),
