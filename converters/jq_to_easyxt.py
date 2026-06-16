@@ -124,13 +124,23 @@ class JQToEasyXTConverter:
             converted_functions[func_name]['body'] = self._fix_func_calls(
                 converted_functions[func_name]['body'], all_func_names)
 
-        # Step 4.6: 后处理 — get_stock_list().index.tolist() → get_stock_list()
+        # Step 4.6: 后处理 — 数据访问模式修正
         for func_name in converted_functions:
             body = converted_functions[func_name]['body']
+            # get_stock_list().index.tolist() → get_stock_list()
             body = re.sub(r'api\.get_stock_list\(\)\.index\.tolist\(\)',
                           'api.get_stock_list()', body)
             body = re.sub(r'api\.get_stock_list\(\)\.index\b',
                           'api.get_stock_list()', body)
+            # get_stock_info(stock).start_date → get_stock_info兼容
+            body = re.sub(
+                r'api\.get_stock_info\((\w+)\)\.start_date',
+                r'_stock_listed_date(api, \1)', body)
+            # get_price dict访问 → _history_dict 包装
+            # api.get_price(stock_list, count=1, period='1m', fields=['close'])
+            body = re.sub(
+                r'api\.get_price\((\w+),\s*count=(\d+),\s*period=([^,]+),\s*fields=\[([^\]]+)\]\)',
+                r'_history_dict(api, \1, count=\2, period=\3, fields=[\4])', body)
             # DataFrame 行属性访问 → _wrap_position
             body = re.sub(
                 r'api\.get_positions\(ACCOUNT_ID\)\[(\w+)\]\.total_amount',
@@ -733,6 +743,10 @@ class JQToEasyXTConverter:
         parts.append('')
 
         # ---- 兼容函数 ----
+        # _history_dict + _stock_listed_date 始终注入（被多模式使用）
+        parts.append(self._gen_history_dict())
+        parts.append('')
+
         if analysis['uses_get_current_data']:
             parts.append(self._gen_current_data_compat())
             parts.append('')
@@ -861,6 +875,44 @@ class JQToEasyXTConverter:
     #  兼容函数生成
     # ================================================================
 
+    def _gen_history_dict(self) -> str:
+        """注入 _history_dict — get_price → JQ风格 {code: [values]}"""
+        self._add_function('_history_dict()')
+        return '''# ========================================
+# get_price → JQ风格 {code: [values]} 包装
+# ========================================
+def _history_dict(api, codes, count=None, period='1d', fields=None, start=None, end=None):
+    """将 api.get_price(DataFrame) 包装为 JQ 风格 {code: {field: [values]}}"""
+    if fields is None:
+        fields = ['close']
+    if isinstance(fields, str):
+        fields = [fields]
+    df = api.get_price(codes, count=count, period=period, fields=fields, start=start, end=end)
+    if df is None or df.empty:
+        return {}
+    result = {}
+    for code in df['code'].unique() if 'code' in df.columns else [codes] if isinstance(codes, str) else codes:
+        sub = df[df['code'] == code] if 'code' in df.columns else df
+        result[code] = {}
+        for f in fields:
+            if f in sub.columns:
+                result[code][f] = sub[f].tolist()
+    return result
+
+def _stock_listed_date(api, stock_code):
+    """获取上市日期,兼容 get_stock_info 返回 dict"""
+    info = api.get_stock_info(stock_code)
+    if info is None:
+        return None
+    # get_stock_info 返回 dict, 字段名是 'first_date'
+    date_str = info.get('first_date') or info.get('start_date') or info.get('listed_date', '')
+    if not date_str:
+        return None
+    try:
+        return datetime.strptime(str(date_str)[:10].replace('-', ''), '%Y%m%d').date()
+    except Exception:
+        return None'''
+
     def _gen_current_data_compat(self) -> str:
         self._add_function('get_current_data_compat()')
         return '''# ========================================
@@ -950,7 +1002,7 @@ def get_factor_values_compat(api, stock_list, factor_name, end_date=None, count=
         'pe': ('daily_basic', 'pe'),
         'pe_ttm': ('daily_basic', 'pe_ttm'),
         'pb': ('daily_basic', 'pb'),
-        'PEG': None,  # PEG = PE / 增长率，需自定义计算
+        'PEG': '__CUSTOM__',  # PEG = PE / (净利润增长率 * 100)，跨表计算
         'turnover_volatility': None,
         'total_revenue': ('fina_indicator', 'total_revenue'),
         'net_profit': ('fina_indicator', 'net_profit'),
@@ -964,6 +1016,35 @@ def get_factor_values_compat(api, stock_list, factor_name, end_date=None, count=
     info = FACTOR_MAP[factor_name]
     if info is None:
         print(f'[WARNING] 因子 "{factor_name}" 需自定义计算公式')
+        return None
+
+    # PEG 跨表自定义计算: PE / (净利润增长率 * 100)
+    if info == '__CUSTOM__':
+        if factor_name == 'PEG':
+            try:
+                ts_code_str = ','.join(ts_codes)
+                pe_df = pro.daily_basic(ts_code=ts_code_str, trade_date=end_date, fields='ts_code,pe')
+                growth_df = pro.fina_indicator(ts_code=ts_code_str, fields='ts_code,net_profit_growth_rate')
+                if pe_df is None or pe_df.empty or growth_df is None or growth_df.empty:
+                    print('[WARNING] tushare 未返回 PEG 计算所需数据')
+                    return None
+                merged = pe_df.merge(growth_df, on='ts_code', how='inner')
+                merged['PEG'] = merged['pe'] / (merged['net_profit_growth_rate'].abs() * 100 + 0.01)
+                merged = merged[merged['PEG'] > 0]
+                result_df = pd.DataFrame(index=stock_list)
+                result_df['PEG'] = None
+                for _, row in merged.iterrows():
+                    jq_code = _ts_to_jq(row['ts_code'])
+                    if jq_code in result_df.index:
+                        result_df.at[jq_code, 'PEG'] = row['PEG']
+                result_df = result_df.dropna()
+                if result_df.empty:
+                    return None
+                wrapper = pd.DataFrame({'PEG': [result_df['PEG'].tolist()]})
+                return wrapper
+            except Exception as e:
+                print(f'[ERROR] PEG计算失败: {e}')
+                return None
         return None
 
     table, field = info
