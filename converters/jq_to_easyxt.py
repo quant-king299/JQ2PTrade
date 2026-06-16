@@ -85,16 +85,29 @@ class JQToEasyXTConverter:
         extracted = self._extract_code_blocks(code)
 
         # Step 4: 对每个函数体应用转换管道
+        all_func_names = set(extracted['functions'].keys())
         converted_functions = {}
-        for func_name, func_body in extracted['functions'].items():
-            body = func_body
+        for func_name, func_info in extracted['functions'].items():
+            body = func_info['body']
             body = self._convert_function_body(body)
             body = self._convert_trading_apis(body)
             body = self._convert_context_access(body)
+            # 独立 context → api（函数调用参数中）
+            body = self._convert_bare_context(body)
             body = self._standardize_codes(body)
             body = self._fix_get_price_params(body)
             body = self._fix_date_formats(body)
-            converted_functions[func_name] = body
+            # 修正 history→get_price 的参数顺序
+            body = self._fix_history_params(body)
+            converted_functions[func_name] = {
+                'body': body,
+                'params': func_info['params'],
+            }
+
+        # Step 4.5: 修正函数调用中缺失的 api 参数
+        for func_name in converted_functions:
+            converted_functions[func_name]['body'] = self._fix_func_calls(
+                converted_functions[func_name]['body'], all_func_names)
 
         # Step 5: 生成最终脚本
         final_code = self._generate_script(
@@ -190,14 +203,32 @@ class JQToEasyXTConverter:
 
         while i < len(lines):
             line = lines[i]
-            func_match = re.match(r'def\s+(\w+)\s*\([^)]*\)\s*:', line)
+            # 匹配函数定义，同时捕获完整参数列表
+            func_match = re.match(r'def\s+(\w+)\s*\(([^)]*)\)\s*:', line)
 
             if func_match:
-                result['global_vars'].extend(
-                    [l for l in global_lines if l.strip() and not l.strip().startswith('#')])
+                # 保存函数前的全局变量（排除 import/from/注释/空行）
+                for gl in global_lines:
+                    stripped = gl.strip()
+                    if not stripped:
+                        continue
+                    if stripped.startswith('#'):
+                        continue
+                    if stripped.startswith('import ') or stripped.startswith('from '):
+                        continue
+                    result['global_vars'].append(gl)
                 global_lines = []
 
                 func_name = func_match.group(1)
+                func_params_str = func_match.group(2).strip()
+
+                # 解析参数：移除 context，保留其余
+                params = [p.strip() for p in func_params_str.split(',') if p.strip()]
+                kept_params = [p for p in params
+                               if p not in ('context',) and not p.startswith('context:')]
+                # 始终在第一位插入 api
+                new_params = ['api'] + kept_params
+
                 body_lines = []
                 i += 1
                 while i < len(lines):
@@ -208,25 +239,58 @@ class JQToEasyXTConverter:
                         continue
                     if re.match(r'^(def\s+|class\s+|@)', lines[i]):
                         break
+                    # 检查缩进：函数体内容必须有缩进（或特殊关键字）
                     if lines[i] and (lines[i][0] in (' ', '\t') or
                                      stripped.startswith(('return ', 'if ', 'for ', 'while ',
-                                                          'try:', 'except', 'else:', 'elif '))):
+                                                          'try:', 'except', 'else:', 'elif ',
+                                                          'break', 'continue', 'pass'))):
                         body_lines.append(lines[i])
                         i += 1
                     else:
                         break
-                result['functions'][func_name] = '\n'.join(body_lines)
+
+                # 清理 body 尾部：移除尾随的空行和纯注释
+                body_stripped = body_lines[:]
+                while body_stripped and (body_stripped[-1].strip() == '' or
+                         body_stripped[-1].strip().startswith('#')):
+                    # 只移除明显是"分隔符"的注释（非函数体内注释）
+                    last = body_stripped[-1].strip()
+                    if last == '' or re.match(r'^#\d+-\d+|^#={3,}|^#-{3,}', last):
+                        body_stripped.pop()
+                    else:
+                        break
+
+                result['functions'][func_name] = {
+                    'body': '\n'.join(body_stripped),
+                    'params': ', '.join(new_params),
+                }
             else:
                 global_lines.append(line)
                 i += 1
 
+        # 处理文件末尾的全局变量
+        for gl in global_lines:
+            stripped = gl.strip()
+            if not stripped or stripped.startswith('#'):
+                continue
+            if stripped.startswith('import ') or stripped.startswith('from '):
+                continue
+            result['global_vars'].append(gl)
+
         # 转换 g.xxx = yyy 为全局变量
-        for gl in result['global_vars'][:]:
+        filtered_vars = []
+        for gl in result['global_vars']:
+            stripped = gl.strip()
+            # 跳过 import/from（二次过滤）
+            if stripped.startswith('import ') or stripped.startswith('from '):
+                continue
             g_match = re.match(r'g\.(\w+)\s*=\s*(.+)', gl)
             if g_match:
-                result['global_vars'].remove(gl)
-                result['global_vars'].append(f'{g_match.group(1)} = {g_match.group(2)}')
+                filtered_vars.append(f'{g_match.group(1)} = {g_match.group(2)}')
                 self._add_mapping(f'g.{g_match.group(1)} → 全局变量')
+            else:
+                filtered_vars.append(gl)
+        result['global_vars'] = filtered_vars
 
         return result
 
@@ -256,10 +320,14 @@ class JQToEasyXTConverter:
                     new_line = new_line.replace(f'{jq_log}(', f'{py_log}(')
                     self._add_mapping(f'{jq_log}() → {py_log}()')
 
-            # API 映射
-            for jq_api, easyxt_api in self.api_mapping.items():
-                if f'{jq_api}(' in new_line:
-                    new_line = new_line.replace(f'{jq_api}(', f'{easyxt_api}(')
+            # API 映射（最长优先 + 防子串误匹配：前面不能有 .）
+            sorted_apis = sorted(self.api_mapping.items(),
+                                 key=lambda x: len(x[0]), reverse=True)
+            for jq_api, easyxt_api in sorted_apis:
+                # 只匹配非方法调用：前面不能有 . 或字母
+                pattern = rf'(?<![.\w]){re.escape(jq_api)}\s*\('
+                if re.search(pattern, new_line):
+                    new_line = re.sub(pattern, f'{easyxt_api}(', new_line)
                     self._add_mapping(f'{jq_api}() → {easyxt_api}()')
 
             # get_current_data() → get_current_data_compat(api, ...)
@@ -418,6 +486,8 @@ class JQToEasyXTConverter:
         context_map = [
             ('context.portfolio.available_cash',
              'api.get_account_asset(ACCOUNT_ID).get("available_cash", 0)'),
+            ('context.portfolio.cash',
+             'api.get_account_asset(ACCOUNT_ID).get("available_cash", 0)'),
             ('context.portfolio.total_value',
              'api.get_account_asset(ACCOUNT_ID).get("total_value", 0)'),
             ('context.portfolio.positions.keys()',
@@ -433,6 +503,62 @@ class JQToEasyXTConverter:
             if old in body:
                 body = body.replace(old, new)
                 self._add_mapping(f'{old} → EasyXT API')
+
+        return body
+
+    # ================================================================
+    #  Step 4c2: 独立 context → api
+    # ================================================================
+
+    def _convert_bare_context(self, body: str) -> str:
+        """将函数调用中的 context 参数替换为 api（不触碰 context.xxx 和字符串）"""
+        # 匹配作为函数参数的 context（前面是逗号/括号，后面是逗号/括号）
+        body = re.sub(r'(?<!\w)(context)(?!\s*\.)(?=\s*[,)])', 'api', body)
+        return body
+
+    # ================================================================
+    #  Step 4g: history/get_price 参数顺序修正
+    # ================================================================
+
+    def _fix_history_params(self, body: str) -> str:
+        """JQ history(count, unit, field, security_list) → EasyXT get_price(codes, count, period, fields)"""
+        # 匹配 api.get_price(N, unit='1m', field='close', security_list=xxx)
+        # 或 api.get_price(stock, N, '1d', ['close'], ...)
+        # JQ风格: history/get_price(count, unit=..., field=..., security_list=...)
+        # EasyXT风格: get_price(codes, count=N, period='1d', fields=[...])
+        pattern = r'api\.get_price\s*\(\s*(\d+)\s*,\s*unit\s*=\s*([^,)]+)\s*,\s*field\s*=\s*([^,)]+)\s*,\s*security_list\s*=\s*([^)]+)\)'
+        if re.search(pattern, body):
+            body = re.sub(pattern,
+                          r'api.get_price(\4, count=\1, period=\2, fields=[\3])',
+                          body)
+            self._add_change('history参数重排: (count,unit,field,security_list) → (codes,count,period,fields)')
+        return body
+
+    # ================================================================
+    #  Step 4h: 修正函数调用中缺失的 api 参数
+    # ================================================================
+
+    def _fix_func_calls(self, body: str, all_func_names: set) -> str:
+        """对已转换为首参数 api 的函数，在调用处自动补上 api"""
+        # 需要跳过的：内建函数、api.xxx 方法、已有 api 作为首参的调用
+        skip_names = {'initialize', 'main', 'get_price', 'get_current_data',
+                      'get_current_data_compat', 'get_trades', 'get_fundamentals',
+                      'query', 'get_ols', 'get_zscore',
+                      'get_factor_values', 'attribute_history', 'history',
+                      'get_bars', 'get_all_securities', 'get_security_info',
+                      'get_index_stocks', 'get_trade_days', 'get_trading_dates',
+                      'get_snapshot', 'get_extras', 'get_industry',
+                      'order', 'order_value', 'order_target', 'cancel_order',
+                      'log'}
+
+        for fname in sorted(all_func_names, key=len, reverse=True):
+            if fname in skip_names:
+                continue
+            # 匹配非方法调用（前面没有 .）且首参不是 api
+            pattern = rf'(?<![.\w])({re.escape(fname)})\s*\(\s*(?!api\b)'
+            if re.search(pattern, body):
+                body = re.sub(pattern, rf'\1(api, ', body)
+                self._add_mapping(f'调用 {fname}() 补上 api 首参')
 
         return body
 
@@ -520,12 +646,13 @@ class JQToEasyXTConverter:
         parts.append('# ========================================')
         parts.append('')
 
-        for func_name, body in functions.items():
+        for func_name, func_info in functions.items():
             if func_name in ('initialize',):
                 continue
-            parts.append(f'def {func_name}(api):')
+            body = func_info['body']
+            params = func_info['params']
+            parts.append(f'def {func_name}({params}):')
             if body.strip():
-                # 先移除公共缩进，再加函数级 4 空格
                 dedented = textwrap.dedent(body)
                 parts.append(textwrap.indent(dedented, '    '))
             else:
