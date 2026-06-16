@@ -1,827 +1,701 @@
 """
-聚宽转EasyXT智能转换器
-将聚宽策略自动转换为可以在miniqmt上运行的EasyXT策略
+聚宽转EasyXT智能转换器 V2.0
+将聚宽策略自动转换为可以在MiniQMT上运行的EasyXT策略
 
-核心功能：
-1. 框架转换：initialize/handle_data → 独立脚本
-2. API映射：聚宽API → EasyXT API
-3. 数据结构转换：DataFrame格式适配
-4. 交易函数转换：order_* → api.buy/sell
-5. 定时任务转换：run_daily → 主循环
+V2.0 更新:
+- ✅ 交易API真实转换：order_* → api.buy/sell，不再是TODO
+- ✅ 参数修正：移除JQ独有参数，日期格式转换
+- ✅ 股票代码标准化：.XSHG→.SH, .XSHE→.SZ
+- ✅ 兼容函数注入：get_current_data_compat()
+- ✅ context访问转换：portfolio→api.get_account_asset/get_positions
+- ✅ 不支持API清理：set_option/set_order_cost/enable_profile等
+- ✅ 完善框架生成：可运行的EasyXT脚本
 
-作者：量化之王
-版本：v1.0.0
+作者：王者Quant
+版本：v2.0.0
 """
 
 import re
-import ast
-from typing import Dict, List, Tuple, Optional, Set
+import textwrap
+from typing import Dict, List, Optional
 from datetime import datetime
-from enum import Enum
-
-
-class ConversionLogLevel(Enum):
-    """转换日志级别"""
-    INFO = "INFO"
-    WARNING = "WARNING"
-    ERROR = "ERROR"
-    SUCCESS = "SUCCESS"
 
 
 class JQToEasyXTConverter:
-    """
-    聚宽到EasyXT转换器
-
-    功能特点：
-    1. 自动识别聚宽策略类型
-    2. 智能转换API调用
-    3. 重构策略框架
-    4. 生成完整的EasyXT可运行代码
-    5. 提供详细的转换报告
-    """
+    """聚宽到EasyXT转换器 V2.0"""
 
     def __init__(self, verbose: bool = True, account_id: str = "YOUR_ACCOUNT_ID"):
-        """
-        初始化转换器
-
-        Args:
-            verbose: 是否输出详细日志
-            account_id: 默认账户ID（可在转换后修改）
-        """
         self.verbose = verbose
         self.account_id = account_id
-
-        # 转换报告
         self.conversion_report = {
-            'infos': [],
+            'api_mappings': [],
             'warnings': [],
             'errors': [],
-            'successes': [],
-            'api_mappings': [],
+            'changes': [],
+            'added_functions': [],
             'manual_fixes': []
         }
 
-        # 聚宽 → EasyXT API映射
+        # API映射表
         self.api_mapping = {
-            # 数据获取API
             'get_price': 'api.get_price',
-            'get_history': 'api.get_price',
-            'attribute_history': 'api.get_price',
             'get_bars': 'api.get_price',
-            'get_current_data': 'api.get_current_price',
-            'get_snapshot': 'api.get_current_price',
-
-            # 股票列表API
-            'get_all_securities': 'api.get_stock_list',
-            'get_index_stocks': 'api.get_stock_list',  # 需要参数调整
-            'get_industry_stocks': None,  # 需要手动处理
-
-            # 交易日历API
+            'history': 'api.get_price',
+            'attribute_history': 'api.get_price',
             'get_trade_days': 'api.get_trading_dates',
             'get_trading_dates': 'api.get_trading_dates',
-
-            # 基本面数据API（需要额外处理）
-            'get_fundamentals': None,  # 需要手动处理
-
-            # 交易API（需要复杂转换）
-            'order': None,  # 需要根据参数转换为buy/sell
-            'order_value': None,
-            'order_target': None,
-            'order_target_value': None,
-            'cancel_order': None,  # EasyXT暂不支持
-
-            # 系统API
-            'log.info': 'print',
-            'log.warn': 'print',
-            'log.error': 'print',
-            'log.debug': 'print',
-            'set_benchmark': None,  # EasyXT不需要，记录即可
+            'get_all_securities': 'api.get_stock_list',
+            'get_security_info': 'api.get_stock_info',
         }
 
-        # 定时任务映射
-        self.timing_mapping = {
-            'run_daily': 'handle_bar',
-            'run_weekly': 'handle_bar_weekly',
-            'run_monthly': 'handle_bar_monthly',
-            'run_minute': 'handle_tick',
+        # 不支持API — 直接移除
+        self.unsupported_apis = [
+            'set_option', 'set_order_cost', 'set_commission',
+            'set_price_limit', 'enable_profile', 'log.set_level',
+        ]
+
+        # 注释掉的API
+        self.comment_apis = ['set_benchmark', 'set_universe']
+
+        # log映射
+        self.log_mapping = {
+            'log.info': 'print', 'log.warn': 'print',
+            'log.error': 'print', 'log.debug': 'print',
         }
+
+    # ================================================================
+    #  主转换入口
+    # ================================================================
 
     def convert(self, jq_code: str, output_file: Optional[str] = None) -> str:
-        """
-        转换聚宽代码为EasyXT代码
-
-        Args:
-            jq_code: 聚宽策略代码
-            output_file: 输出文件路径（可选）
-
-        Returns:
-            str: 转换后的EasyXT代码
-        """
-        # 重置转换报告
         self._reset_report()
 
         if self.verbose:
-            print("=" * 80)
-            print("聚宽转EasyXT智能转换器")
-            print("=" * 80)
-            print(f"转换时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            print("=" * 80)
+            print("=" * 70)
+            print("聚宽转EasyXT智能转换器 V2.0")
+            print("=" * 70)
 
-        # 1. 分析聚宽代码
-        code_analysis = self._analyze_jq_code(jq_code)
+        # Step 1: 分析
+        analysis = self._analyze_code(jq_code)
 
-        # 2. 提取关键信息
-        initialize_code = self._extract_initialize(jq_code)
-        handle_data_code = self._extract_handle_data(jq_code)
-        scheduled_functions = self._extract_scheduled_functions(jq_code)
+        # Step 2: 移除不支持API & 清理导入
+        code = self._remove_unsupported(jq_code)
 
-        if self.verbose:
-            print(f"\n✅ 代码分析完成")
-            print(f"   - initialize函数: {'已找到' if initialize_code else '未找到'}")
-            print(f"   - handle_data函数: {'已找到' if handle_data_code else '未找到'}")
-            print(f"   - 定时任务函数: {len(scheduled_functions)}个")
+        # Step 3: 提取函数体（纯文本）和全局变量
+        extracted = self._extract_code_blocks(code)
 
-        # 3. 转换代码
-        converted_code = self._convert_code(
-            jq_code,
-            initialize_code,
-            handle_data_code,
-            scheduled_functions,
-            code_analysis
+        # Step 4: 对每个函数体应用转换管道
+        converted_functions = {}
+        for func_name, func_body in extracted['functions'].items():
+            body = func_body
+            body = self._convert_function_body(body)
+            body = self._convert_trading_apis(body)
+            body = self._convert_context_access(body)
+            body = self._standardize_codes(body)
+            body = self._fix_get_price_params(body)
+            body = self._fix_date_formats(body)
+            converted_functions[func_name] = body
+
+        # Step 5: 生成最终脚本
+        final_code = self._generate_script(
+            global_vars=extracted['global_vars'],
+            functions=converted_functions,
+            analysis=analysis,
         )
 
-        # 4. 生成完整脚本
-        final_code = self._generate_complete_script(converted_code, code_analysis)
-
-        # 5. 保存文件（如果指定）
         if output_file:
             with open(output_file, 'w', encoding='utf-8') as f:
                 f.write(final_code)
-            self._log_success(f"转换后的代码已保存到: {output_file}")
 
-        # 6. 打印转换报告
         if self.verbose:
-            self._print_conversion_report()
+            self._print_report()
 
         return final_code
 
-    def _reset_report(self):
-        """重置转换报告"""
-        self.conversion_report = {
-            'infos': [],
-            'warnings': [],
-            'errors': [],
-            'successes': [],
-            'api_mappings': [],
-            'manual_fixes': []
-        }
+    # ================================================================
+    #  Step 1: 代码分析
+    # ================================================================
 
-    def _analyze_jq_code(self, code: str) -> Dict:
-        """
-        分析聚宽代码
-
-        Returns:
-            Dict: 代码分析结果
-        """
+    def _analyze_code(self, code: str) -> Dict:
         analysis = {
             'has_initialize': bool(re.search(r'def\s+initialize\s*\(', code)),
             'has_handle_data': bool(re.search(r'def\s+handle_data\s*\(', code)),
-            'uses_context': 'context.' in code,
-            'uses_data': 'data.' in code,
-            'uses_global_g': 'g.' in code,
-            'scheduled_functions': [],
-            'used_apis': set(),
             'has_trading': False,
-            'has_fundamentals': False,
-            'has_indicators': False,
+            'uses_get_current_data': False,
+            'uses_fundamentals': False,
+            'timing_functions': [],  # [(type, func_name, params_str)]
         }
 
-        # 检测定时任务
-        timing_patterns = {
-            'run_daily': r'run_daily\s*\(\s*([^,]+)',
-            'run_weekly': r'run_weekly\s*\(\s*([^,]+)',
-            'run_monthly': r'run_monthly\s*\(\s*([^,]+)',
-            'run_minute': r'run_minute\s*\(\s*([^,]+)',
-        }
+        if re.search(r'\b(order|order_value|order_target|order_target_value|order_target_percent)\s*\(', code):
+            analysis['has_trading'] = True
 
-        for timing_name, pattern in timing_patterns.items():
-            matches = re.findall(pattern, code)
-            for func_name in matches:
-                analysis['scheduled_functions'].append({
-                    'type': timing_name,
-                    'name': func_name.strip()
-                })
+        if re.search(r'\bget_current_data\s*\(', code):
+            analysis['uses_get_current_data'] = True
 
-        # 检测API使用
-        api_patterns = [
-            r'\border\s*\(',
-            r'\border_value\s*\(',
-            r'\border_target\s*\(',
-            r'\border_target_value\s*\(',
+        if re.search(r'\bget_fundamentals\s*\(|\bquery\s*\(', code):
+            analysis['uses_fundamentals'] = True
+
+        timing_patterns = [
+            (r'run_daily\s*\(\s*(\w+)\s*,\s*([^)]+)\)', 'run_daily'),
+            (r'run_weekly\s*\(\s*(\w+)\s*,\s*([^)]+)\)', 'run_weekly'),
+            (r'run_monthly\s*\(\s*(\w+)\s*,\s*([^)]+)\)', 'run_monthly'),
         ]
-        for pattern in api_patterns:
-            if re.search(pattern, code):
-                analysis['has_trading'] = True
-                break
-
-        # 检测基本面数据
-        if 'get_fundamentals' in code or 'query(' in code:
-            analysis['has_fundamentals'] = True
-
-        # 检测技术指标
-        if re.search(r'MACD|RSI|BOLL|KDJ|MACD\s*\(', code):
-            analysis['has_indicators'] = True
+        for pattern, ttype in timing_patterns:
+            for m in re.finditer(pattern, code):
+                analysis['timing_functions'].append(
+                    (ttype, m.group(1), m.group(2).strip()))
 
         return analysis
 
-    def _extract_initialize(self, code: str) -> Optional[str]:
-        """提取initialize函数代码"""
-        pattern = r'def\s+initialize\s*\([^)]*\)\s*:\s*\n((?:\s+.*\n)+)'
-        match = re.search(pattern, code)
-        if match:
-            return match.group(1)
-        return None
+    # ================================================================
+    #  Step 2: 移除不支持API
+    # ================================================================
 
-    def _extract_handle_data(self, code: str) -> Optional[str]:
-        """提取handle_data函数代码"""
-        pattern = r'def\s+handle_data\s*\([^)]*\)\s*:\s*\n((?:\s+.*\n)+?)(?=\ndef\s|\Z)'
-        match = re.search(pattern, code, re.MULTILINE)
-        if match:
-            return match.group(1)
-        return None
+    def _remove_unsupported(self, code: str) -> str:
+        # 移除 jqdata/jqfactor 导入
+        for pattern in [r'^import\s+jqdata.*\n?', r'^from\s+jqdata\s+import.*\n?',
+                         r'^from\s+jqfactor\s+import.*\n?']:
+            if re.search(pattern, code, re.MULTILINE):
+                code = re.sub(pattern, '', code, flags=re.MULTILINE)
+                self._add_change('移除导入: jqdata/jqfactor')
 
-    def _extract_scheduled_functions(self, code: str) -> List[Dict]:
-        """提取定时任务函数"""
-        functions = []
+        # 移除不支持的API
+        for api in self.unsupported_apis:
+            pattern = rf'^[ \t]*{re.escape(api)}\s*\([^)]*\).*\n?'
+            if re.search(pattern, code, re.MULTILINE):
+                code = re.sub(pattern, '', code, flags=re.MULTILINE)
+                self._add_change(f'移除不支持API: {api}()')
 
-        # 提取所有函数定义
-        function_pattern = r'def\s+(\w+)\s*\([^)]*\)\s*:\s*\n((?:\s+.*\n)+?)(?=\ndef\s|\Z)'
-        matches = re.finditer(function_pattern, code, re.MULTILINE)
+        # 注释掉不需要的API
+        for api in self.comment_apis:
+            pattern = rf'^([ \t]*)({re.escape(api)}\s*\([^)]*\))'
+            if re.search(pattern, code, re.MULTILINE):
+                code = re.sub(pattern, r'\1# \2  # EasyXT不需要',
+                              code, flags=re.MULTILINE)
+                self._add_change(f'注释: {api}()')
 
-        for match in matches:
-            func_name = match.group(1)
-            func_body = match.group(2)
+        return code
 
-            # 跳过initialize和handle_data
-            if func_name in ['initialize', 'handle_data']:
-                continue
+    # ================================================================
+    #  Step 3: 提取代码块
+    # ================================================================
 
-            functions.append({
-                'name': func_name,
-                'body': func_body
-            })
+    def _extract_code_blocks(self, code: str) -> Dict:
+        """提取函数体（纯文本，保留原始缩进）和全局变量"""
+        result = {'global_vars': [], 'functions': {}}
 
-        return functions
+        lines = code.split('\n')
+        i = 0
+        global_lines = []
 
-    def _convert_code(self, original_code: str, initialize_code: Optional[str],
-                     handle_data_code: Optional[str], scheduled_functions: List[Dict],
-                     analysis: Dict) -> Dict:
-        """
-        执行代码转换
+        while i < len(lines):
+            line = lines[i]
+            func_match = re.match(r'def\s+(\w+)\s*\([^)]*\)\s*:', line)
 
-        Returns:
-            Dict: 包含转换后各部分的字典
-        """
-        result = {
-            'imports': [],
-            'global_vars': [],
-            'initialize_logic': '',
-            'main_loop_logic': '',
-            'helper_functions': []
-        }
+            if func_match:
+                result['global_vars'].extend(
+                    [l for l in global_lines if l.strip() and not l.strip().startswith('#')])
+                global_lines = []
 
-        # 1. 转换导入语句
-        result['imports'] = self._convert_imports(original_code)
+                func_name = func_match.group(1)
+                body_lines = []
+                i += 1
+                while i < len(lines):
+                    stripped = lines[i].strip()
+                    if stripped == '' or stripped.startswith('#'):
+                        body_lines.append(lines[i])
+                        i += 1
+                        continue
+                    if re.match(r'^(def\s+|class\s+|@)', lines[i]):
+                        break
+                    if lines[i] and (lines[i][0] in (' ', '\t') or
+                                     stripped.startswith(('return ', 'if ', 'for ', 'while ',
+                                                          'try:', 'except', 'else:', 'elif '))):
+                        body_lines.append(lines[i])
+                        i += 1
+                    else:
+                        break
+                result['functions'][func_name] = '\n'.join(body_lines)
+            else:
+                global_lines.append(line)
+                i += 1
 
-        # 2. 转换全局变量
-        if initialize_code:
-            result['global_vars'], result['initialize_logic'] = self._convert_initialize(initialize_code)
-
-        # 3. 转换主逻辑
-        if handle_data_code:
-            result['main_loop_logic'] = self._convert_handle_data(handle_data_code)
-
-        # 4. 转换定时任务函数
-        for func in scheduled_functions:
-            converted_func = self._convert_scheduled_function(func)
-            result['helper_functions'].append(converted_func)
+        # 转换 g.xxx = yyy 为全局变量
+        for gl in result['global_vars'][:]:
+            g_match = re.match(r'g\.(\w+)\s*=\s*(.+)', gl)
+            if g_match:
+                result['global_vars'].remove(gl)
+                result['global_vars'].append(f'{g_match.group(1)} = {g_match.group(2)}')
+                self._add_mapping(f'g.{g_match.group(1)} → 全局变量')
 
         return result
 
-    def _convert_imports(self, code: str) -> List[str]:
-        """转换导入语句"""
-        imports = []
+    # ================================================================
+    #  Step 4: 转换函数体（文本进，文本出）
+    # ================================================================
 
-        # 添加标准导入
-        imports.append("import sys")
-        imports.append("import os")
-        imports.append("from datetime import datetime, timedelta")
-        imports.append("import pandas as pd")
-        imports.append("import time")
-
-        # 添加项目路径
-        imports.append("")
-        imports.append("# 添加项目根目录到Python路径")
-        imports.append("current_dir = os.path.dirname(os.path.abspath(__file__))")
-        imports.append("project_root = os.path.dirname(current_dir)")
-        imports.append("sys.path.insert(0, project_root)")
-        imports.append("")
-        imports.append("# 导入EasyXT")
-        imports.append("import easy_xt")
-
-        # 保留原代码中的必要导入
-        original_imports = re.findall(r'^(import\s+.*|from\s+.*import\s+.*)$', code, re.MULTILINE)
-        for imp in original_imports:
-            # 跳过聚宽特定的导入
-            if 'jqdata' not in imp and 'jqfactor' not in imp:
-                if imp not in imports:
-                    imports.append(f"# {imp}  # 保留原导入")
-
-        return imports
-
-    def _convert_initialize(self, initialize_code: str) -> Tuple[List[str], str]:
-        """
-        转换initialize函数
-
-        Returns:
-            Tuple[List[str], str]: (全局变量定义, 初始化逻辑)
-        """
-        global_vars = []
-        init_logic = []
-
-        # 提取g.开头的全局变量
-        g_assignments = re.findall(r'(g\.\w+)\s*=\s*(.+)', initialize_code)
-
-        for var_name, var_value in g_assignments:
-            # g.xxx → xxx
-            new_var_name = var_name.replace('g.', '')
-            global_vars.append(f"{new_var_name} = {var_value}")
-            self._log_api_mapping(f"g.{new_var_name} → 全局变量")
-
-        # 转换其他初始化逻辑
-        lines = initialize_code.split('\n')
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith('#'):
+    def _convert_function_body(self, body: str) -> str:
+        """API名称映射 + g.xxx清理 + log转换"""
+        result_lines = []
+        for line in body.split('\n'):
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#'):
+                result_lines.append(line)
                 continue
 
-            # 跳过g.变量赋值（已处理）
-            if re.match(r'g\.\w+\s*=', line):
+            new_line = line
+
+            # g.xxx → xxx（排除 log.xxx）
+            if 'g.' in stripped and not any(
+                    kw in stripped for kw in ['log.', 'str.', '.g.']):
+                new_line = re.sub(r'\bg\.(\w+)', r'\1', new_line)
+
+            # log.xxx → print
+            for jq_log, py_log in self.log_mapping.items():
+                if f'{jq_log}(' in new_line:
+                    new_line = new_line.replace(f'{jq_log}(', f'{py_log}(')
+                    self._add_mapping(f'{jq_log}() → {py_log}()')
+
+            # API 映射
+            for jq_api, easyxt_api in self.api_mapping.items():
+                if f'{jq_api}(' in new_line:
+                    new_line = new_line.replace(f'{jq_api}(', f'{easyxt_api}(')
+                    self._add_mapping(f'{jq_api}() → {easyxt_api}()')
+
+            # get_current_data() → get_current_data_compat(api, ...)
+            if 'get_current_data()' in new_line:
+                new_line = new_line.replace(
+                    'get_current_data()', 'get_current_data_compat(api)')
+                self._add_mapping('get_current_data() → get_current_data_compat(api)')
+
+            result_lines.append(new_line)
+
+        return '\n'.join(result_lines)
+
+    # ================================================================
+    #  Step 4b: 交易API转换
+    # ================================================================
+
+    def _convert_trading_apis(self, body: str) -> str:
+        """智能转换所有JQ交易API → EasyXT api.buy/sell"""
+        result_lines = []
+        for line in body.split('\n'):
+            stripped = line.strip()
+            indent = line[:len(line) - len(line.lstrip())]
+
+            if 'order_target_percent(' in stripped:
+                result_lines.append(self._conv_order_target_percent(stripped, indent))
+            elif 'order_target_value(' in stripped:
+                result_lines.append(self._conv_order_target_value(stripped, indent))
+            elif 'order_target(' in stripped:
+                result_lines.append(self._conv_order_target(stripped, indent))
+            elif 'order_value(' in stripped:
+                result_lines.append(self._conv_order_value(stripped, indent))
+            elif re.search(r'\border\s*\(', stripped) and 'cancel_order' not in stripped:
+                result_lines.append(self._conv_order(stripped, indent))
+            elif 'cancel_order(' in stripped:
+                result_lines.append(self._conv_cancel_order(stripped, indent))
+            else:
+                result_lines.append(line)
+
+        return '\n'.join(result_lines)
+
+    def _conv_order(self, stripped: str, indent: str) -> str:
+        """order(security, amount) → api.buy/sell"""
+        m = re.search(r'\border\s*\(\s*([^,]+)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)', stripped)
+        if m:
+            sec, amt = m.group(1), m.group(2)
+            if float(amt) > 0:
+                self._add_mapping(f'order({sec}, {amt}) → api.buy()')
+                return f'{indent}api.buy(ACCOUNT_ID, {sec}, {int(float(amt))})'
+            elif float(amt) < 0:
+                self._add_mapping(f'order({sec}, {amt}) → api.sell()')
+                return f'{indent}api.sell(ACCOUNT_ID, {sec}, {int(abs(float(amt)))})'
+            else:
+                return f'{indent}# order({sec}, 0) — 无需操作'
+        self._add_warning(f'order() 格式无法识别: {stripped[:60]}')
+        return f'{indent}{stripped}'
+
+    def _conv_order_value(self, stripped: str, indent: str) -> str:
+        """order_value(security, value) → 按金额计算股数买入"""
+        m = re.search(r'order_value\s*\(\s*([^,]+)\s*,\s*([^)]+)\s*\)', stripped)
+        if m:
+            sec, val = m.group(1), m.group(2)
+            self._add_mapping(f'order_value({sec}, {val}) → 按金额买入')
+            return f"""{indent}# order_value({sec}, {val}) → 按金额买入
+{indent}_price = api.get_current_price({sec})
+{indent}if _price is not None and not _price.empty:
+{indent}    _latest = float(_price.iloc[-1]) if hasattr(_price, "iloc") else float(_price)
+{indent}    _volume = int(({val}) / _latest / 100) * 100
+{indent}    if _volume > 0:
+{indent}        api.buy(ACCOUNT_ID, {sec}, _volume)"""
+        return f'{indent}{stripped}'
+
+    def _conv_order_target(self, stripped: str, indent: str) -> str:
+        """order_target(security, target) → 调整持仓"""
+        m = re.search(r'order_target\s*\(\s*([^,]+)\s*,\s*([^)]+)\s*\)', stripped)
+        if m:
+            sec, target = m.group(1), m.group(2)
+            if target.strip() == '0':
+                self._add_mapping(f'order_target({sec}, 0) → 清仓卖出')
+                return f"""{indent}# order_target({sec}, 0) → 清仓
+{indent}_pos = api.get_positions(ACCOUNT_ID, {sec})
+{indent}if _pos is not None and not _pos.empty:
+{indent}    _vol = int(_pos.iloc[0]["volume"])
+{indent}    if _vol > 0:
+{indent}        api.sell(ACCOUNT_ID, {sec}, _vol)"""
+            self._add_mapping(f'order_target({sec}, {target}) → 调仓')
+            return f"""{indent}# order_target({sec}, {target}) → 调整持仓
+{indent}_pos = api.get_positions(ACCOUNT_ID, {sec})
+{indent}_current = int(_pos.iloc[0]["volume"]) if _pos is not None and not _pos.empty else 0
+{indent}_diff = ({target}) - _current
+{indent}if _diff > 0:
+{indent}    api.buy(ACCOUNT_ID, {sec}, _diff)
+{indent}elif _diff < 0:
+{indent}    api.sell(ACCOUNT_ID, {sec}, abs(_diff))"""
+        return f'{indent}{stripped}'
+
+    def _conv_order_target_value(self, stripped: str, indent: str) -> str:
+        """order_target_value(security, value) → 按金额调仓"""
+        m = re.search(r'order_target_value\s*\(\s*([^,]+)\s*,\s*([^)]+)\s*\)', stripped)
+        if m:
+            sec, tval = m.group(1), m.group(2)
+            if tval.strip() == '0':
+                return self._conv_order_target(
+                    stripped.replace('order_target_value', 'order_target'), indent)
+            self._add_mapping(f'order_target_value({sec}, {tval}) → 按金额调仓')
+            return f"""{indent}# order_target_value({sec}, {tval}) → 按金额调仓
+{indent}_price = api.get_current_price({sec})
+{indent}if _price is not None and not _price.empty:
+{indent}    _latest = float(_price.iloc[-1]) if hasattr(_price, "iloc") else float(_price)
+{indent}    _target_vol = int(({tval}) / _latest / 100) * 100
+{indent}    _pos = api.get_positions(ACCOUNT_ID, {sec})
+{indent}    _cur_vol = int(_pos.iloc[0]["volume"]) if _pos is not None and not _pos.empty else 0
+{indent}    _diff = _target_vol - _cur_vol
+{indent}    if _diff > 0:
+{indent}        api.buy(ACCOUNT_ID, {sec}, _diff)
+{indent}    elif _diff < 0:
+{indent}        api.sell(ACCOUNT_ID, {sec}, abs(_diff))"""
+        return f'{indent}{stripped}'
+
+    def _conv_order_target_percent(self, stripped: str, indent: str) -> str:
+        """order_target_percent(security, percent) → 百分比调仓"""
+        m = re.search(r'order_target_percent\s*\(\s*([^,]+)\s*,\s*([^)]+)\s*\)', stripped)
+        if m:
+            sec, pct = m.group(1), m.group(2)
+            self._add_mapping(f'order_target_percent({sec}, {pct}) → 百分比调仓')
+            return f"""{indent}# order_target_percent({sec}, {pct}) → 百分比调仓
+{indent}_asset = api.get_account_asset(ACCOUNT_ID)
+{indent}if _asset:
+{indent}    _total = _asset.get("total_value", 0)
+{indent}    _target_value = _total * ({pct})
+{indent}    _price = api.get_current_price({sec})
+{indent}    if _price is not None and not _price.empty:
+{indent}        _latest = float(_price.iloc[-1]) if hasattr(_price, "iloc") else float(_price)
+{indent}        _target_vol = int(_target_value / _latest / 100) * 100
+{indent}        _pos = api.get_positions(ACCOUNT_ID, {sec})
+{indent}        _cur_vol = int(_pos.iloc[0]["volume"]) if _pos is not None and not _pos.empty else 0
+{indent}        _diff = _target_vol - _cur_vol
+{indent}        if _diff > 0:
+{indent}            api.buy(ACCOUNT_ID, {sec}, _diff)
+{indent}        elif _diff < 0:
+{indent}            api.sell(ACCOUNT_ID, {sec}, abs(_diff))"""
+        return f'{indent}{stripped}'
+
+    def _conv_cancel_order(self, stripped: str, indent: str) -> str:
+        m = re.search(r'cancel_order\s*\(\s*([^)]+)\s*\)', stripped)
+        if m:
+            self._add_mapping(f'cancel_order({m.group(1)}) → api.cancel_order()')
+            return f'{indent}api.cancel_order(ACCOUNT_ID, {m.group(1)})'
+        return f'{indent}{stripped}'
+
+    # ================================================================
+    #  Step 4c: context 访问转换
+    # ================================================================
+
+    def _convert_context_access(self, body: str) -> str:
+        """context.xxx → EasyXT API 调用"""
+        context_map = [
+            ('context.portfolio.available_cash',
+             'api.get_account_asset(ACCOUNT_ID).get("available_cash", 0)'),
+            ('context.portfolio.total_value',
+             'api.get_account_asset(ACCOUNT_ID).get("total_value", 0)'),
+            ('context.portfolio.positions.keys()',
+             'api.get_positions(ACCOUNT_ID).index'),
+            ('context.portfolio.positions',
+             'api.get_positions(ACCOUNT_ID)'),
+            ('context.current_dt', 'datetime.now()'),
+            ('context.current_date', 'datetime.now().date()'),
+            ('context.previous_date', '(datetime.now() - timedelta(days=1)).date()'),
+        ]
+
+        for old, new in context_map:
+            if old in body:
+                body = body.replace(old, new)
+                self._add_mapping(f'{old} → EasyXT API')
+
+        return body
+
+    # ================================================================
+    #  Step 4d: 股票代码标准化
+    # ================================================================
+
+    def _standardize_codes(self, body: str) -> str:
+        if '.XSHG' in body or '.XSHE' in body:
+            body = body.replace('.XSHG', '.SH')
+            body = body.replace('.XSHE', '.SZ')
+            self._add_change('股票代码: .XSHG→.SH / .XSHE→.SZ')
+        return body
+
+    # ================================================================
+    #  Step 4e: get_price 参数修正
+    # ================================================================
+
+    def _fix_get_price_params(self, body: str) -> str:
+        for param in ['skip_paused', 'fq', 'panel', 'fill_paused']:
+            if f'{param}=' in body:
+                body = re.sub(rf',\s*{param}\s*=\s*[^,)\]]+', '', body)
+                body = re.sub(rf'{param}\s*=\s*[^,)\]]+,\s*', '', body)
+                self._add_change(f'移除参数: {param}')
+        return body
+
+    # ================================================================
+    #  Step 4f: 日期格式修正
+    # ================================================================
+
+    def _fix_date_formats(self, body: str) -> str:
+        pattern = r'(?:datetime\.)?date\s*\(\s*(\d{4})\s*,\s*(\d{1,2})\s*,\s*(\d{1,2})\s*\)'
+        if re.search(pattern, body):
+            body = re.sub(pattern,
+                          lambda m: f"'{m.group(1)}{m.group(2).zfill(2)}{m.group(3).zfill(2)}'",
+                          body)
+            self._add_change('datetime.date → 字符串日期')
+        return body
+
+    # ================================================================
+    #  Step 5: 生成最终脚本
+    # ================================================================
+
+    def _generate_script(self, global_vars: List[str],
+                         functions: Dict[str, str], analysis: Dict) -> str:
+        parts = []
+
+        # ---- 文件头 ----
+        parts.extend([
+            '# -*- coding: utf-8 -*-',
+            '"""聚宽策略 → EasyXT 自动转换 (V2.0)"""',
+            '',
+            'import time',
+            'import pandas as pd',
+            'import numpy as np',
+            'from datetime import datetime, timedelta',
+            '',
+            'from easy_xt import EasyXT',
+            '',
+            '# ========================================',
+            '# 配置（请修改为实际值）',
+            '# ========================================',
+            f'ACCOUNT_ID = "{self.account_id}"  # TODO: 改为实际账户ID',
+            '',
+        ])
+
+        # ---- 全局变量 ----
+        parts.append('# ========================================')
+        parts.append('# 全局变量（从 g.xxx 转换而来）')
+        parts.append('# ========================================')
+        if global_vars:
+            parts.extend(global_vars)
+        else:
+            parts.append('# 无全局变量')
+        parts.append('')
+
+        # ---- 兼容函数 ----
+        if analysis['uses_get_current_data']:
+            parts.append(self._gen_current_data_compat())
+            parts.append('')
+
+        # ---- 策略函数 ----
+        parts.append('# ========================================')
+        parts.append('# 策略函数')
+        parts.append('# ========================================')
+        parts.append('')
+
+        for func_name, body in functions.items():
+            if func_name in ('initialize',):
                 continue
+            parts.append(f'def {func_name}(api):')
+            if body.strip():
+                # 先移除公共缩进，再加函数级 4 空格
+                dedented = textwrap.dedent(body)
+                parts.append(textwrap.indent(dedented, '    '))
+            else:
+                parts.append('    pass')
+            parts.append('')
+            parts.append('')
 
-            # 转换set_benchmark
-            if 'set_benchmark' in line:
-                init_logic.append(f"# {line}  # EasyXT不需要设置基准")
-                self._log_info("set_benchmark已注释（EasyXT不需要）")
-                continue
+        # ---- 主程序 ----
+        parts.extend([
+            '# ========================================',
+            '# 主程序入口',
+            '# ========================================',
+            'def main():',
+            '    """主策略"""',
+            '    print("=" * 50)',
+            '    print("聚宽→EasyXT 转换策略启动")',
+            '    print("=" * 50)',
+            '',
+            '    # 初始化 EasyXT',
+            '    api = EasyXT(ACCOUNT_ID)',
+            '',
+            '    # 初始化数据服务',
+            '    if not api.init_data():',
+            '        print("[ERROR] 数据服务初始化失败")',
+            '        return',
+            '',
+        ])
 
-            # 保留其他逻辑
-            converted_line = self._convert_line(line)
-            if converted_line:
-                init_logic.append(converted_line)
+        if analysis['has_trading']:
+            parts.extend([
+                '    # 初始化交易服务',
+                '    if not api.init_trade():',
+                '        print("[ERROR] 交易服务初始化失败")',
+                '        return',
+                '    api.add_account(ACCOUNT_ID)',
+                '',
+            ])
 
-        return global_vars, '\n        '.join(init_logic)
+        # 定时任务说明
+        if analysis['timing_functions']:
+            parts.append('    # 原JQ定时任务:')
+            for ttype, fname, params in analysis['timing_functions']:
+                parts.append(f'    #   {ttype}({fname}, {params})')
+            parts.append('')
 
-    def _convert_handle_data(self, handle_data_code: str) -> str:
-        """转换handle_data函数为主循环逻辑"""
-        lines = handle_data_code.split('\n')
-        converted_lines = []
+        # 主循环
+        parts.extend([
+            '    print("开始主循环...")',
+            '    while True:',
+            '        try:',
+        ])
 
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                if line:
-                    converted_lines.append(line)
-                continue
+        called = set()
+        if analysis['timing_functions']:
+            for _, fname, _ in analysis['timing_functions']:
+                if fname not in called:
+                    parts.append(f'            {fname}(api)')
+                    called.add(fname)
+        elif analysis['has_handle_data']:
+            parts.append('            # handle_data 逻辑')
+            parts.append('            handle_data(api)')
+        else:
+            for fname in functions:
+                if fname not in ('initialize',) and fname not in called:
+                    parts.append(f'            {fname}(api)')
+                    called.add(fname)
+                    break
+            if not called:
+                parts.append('            pass')
 
-            converted_line = self._convert_line(line)
-            if converted_line:
-                converted_lines.append(converted_line)
+        parts.extend([
+            '            time.sleep(60)',
+            '        except KeyboardInterrupt:',
+            '            print("\\n用户中断")',
+            '            break',
+            '        except Exception as e:',
+            '            print(f"[ERROR] {e}")',
+            '            time.sleep(60)',
+            '',
+            '',
+            'if __name__ == "__main__":',
+            '    main()',
+            '',
+        ])
 
-        return '\n        '.join(converted_lines)
+        return '\n'.join(parts)
 
-    def _convert_scheduled_function(self, func: Dict) -> Dict:
-        """转换定时任务函数"""
-        func_name = func['name']
-        func_body = func['body']
+    # ================================================================
+    #  兼容函数生成
+    # ================================================================
 
-        converted_body = []
-        lines = func_body.split('\n')
+    def _gen_current_data_compat(self) -> str:
+        self._add_function('get_current_data_compat()')
+        return '''# ========================================
+# get_current_data 兼容函数
+# ========================================
+def get_current_data_compat(api, security_list=None):
+    """模拟聚宽 get_current_data()，使用 EasyXT API"""
+    if security_list is None:
+        security_list = []
+    if isinstance(security_list, str):
+        security_list = [security_list]
 
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                if line:
-                    converted_body.append(line)
-                continue
+    result = {}
+    for code in security_list:
+        try:
+            df = api.get_current_price(code)
+            if df is not None and not df.empty:
+                row = df.iloc[-1]
+                result[code] = {
+                    'last_price': float(row.get('lastPrice', 0)),
+                    'high_limit': float(row.get('highLimit', 0)) or float(row.get('lastPrice', 0)) * 1.1,
+                    'low_limit': float(row.get('lowLimit', 0)) or float(row.get('lastPrice', 0)) * 0.9,
+                    'paused': False,
+                    'is_st': False,
+                    'name': code,
+                    'day_open': float(row.get('open', 0)),
+                }
+        except Exception:
+            result[code] = {
+                'last_price': 0, 'high_limit': 0, 'low_limit': 0,
+                'paused': False, 'is_st': False, 'name': code, 'day_open': 0
+            }
+    return result'''
 
-            converted_line = self._convert_line(line)
-            if converted_line:
-                converted_body.append(converted_line)
+    # ================================================================
+    #  报告系统
+    # ================================================================
 
-        return {
-            'name': func_name,
-            'body': '\n    '.join(converted_body)
+    def _reset_report(self):
+        self.conversion_report = {
+            'api_mappings': [], 'warnings': [], 'errors': [],
+            'changes': [], 'added_functions': [], 'manual_fixes': []
         }
 
-    def _convert_line(self, line: str) -> Optional[str]:
-        """
-        转换单行代码
+    def _add_mapping(self, msg: str):
+        if msg not in self.conversion_report['api_mappings']:
+            self.conversion_report['api_mappings'].append(msg)
 
-        Args:
-            line: 原始代码行
+    def _add_warning(self, msg: str):
+        if msg not in self.conversion_report['warnings']:
+            self.conversion_report['warnings'].append(msg)
 
-        Returns:
-            Optional[str]: 转换后的代码行，如果需要移除则返回None
-        """
-        # 转换g.变量为全局变量
-        if 'g.' in line:
-            line = re.sub(r'\bg\.(\w+)', r'\1', line)
+    def _add_change(self, msg: str):
+        if msg not in self.conversion_report['changes']:
+            self.conversion_report['changes'].append(msg)
 
-        # 转换context对象访问
-        if 'context.' in line:
-            line = self._convert_context_access(line)
+    def _add_function(self, msg: str):
+        if msg not in self.conversion_report['added_functions']:
+            self.conversion_report['added_functions'].append(msg)
 
-        # 转换API调用
-        for jq_api, easyxt_api in self.api_mapping.items():
-            if easyxt_api and f'{jq_api}(' in line:
-                line = line.replace(f'{jq_api}(', f'{easyxt_api}(')
-                self._log_api_mapping(f"{jq_api}() → {easyxt_api}()")
-
-        # 转换交易API
-        if any(api in line for api in ['order(', 'order_value(', 'order_target(', 'order_target_value(']):
-            line = self._convert_trading_api(line)
-
-        # 转换log.info
-        if 'log.info(' in line or 'log.warn(' in line or 'log.error(' in line:
-            line = re.sub(r'log\.(info|warn|error|debug)\(', 'print(', line)
-
-        # 转换get_current_data
-        if 'get_current_data()' in line:
-            self._log_warning("get_current_data()需要手动转换为api.get_current_price()")
-            line = line.replace('get_current_data()', 'api.get_current_price()')
-
-        return line
-
-    def _convert_context_access(self, line: str) -> str:
-        """
-        转换context对象访问
-
-        context.portfolio.available_cash → 可用现金变量
-        context.current_date → datetime.now()
-        context.previous_date → datetime.now() - timedelta(days=1)
-        """
-        # context.portfolio.available_cash
-        if 'context.portfolio.available_cash' in line:
-            self._log_warning("context.portfolio.available_cash需要手动实现账户管理")
-            line = line.replace('context.portfolio.available_cash', 'account_cash')
-
-        # context.current_date
-        if 'context.current_date' in line:
-            line = line.replace('context.current_date', 'datetime.now().date()')
-
-        # context.previous_date
-        if 'context.previous_date' in line:
-            line = line.replace('context.previous_date', '(datetime.now() - timedelta(days=1)).date()')
-
-        # context.portfolio.positions
-        if 'context.portfolio.positions' in line:
-            self._log_warning("context.portfolio.positions需要手动实现持仓管理")
-            line = line.replace('context.portfolio.positions', 'positions')
-
-        return line
-
-    def _convert_trading_api(self, line: str) -> str:
-        """
-        转换交易API
-
-        order_target(security, 0) → api.sell(account_id, security, volume)
-        order_target_value(security, value) → api.buy(account_id, security, volume)
-        """
-        # order_target(security, 0) - 卖出
-        if 'order_target(' in line and ', 0)' in line:
-            match = re.search(r'order_target\s*\(\s*([^,]+),\s*0\s*', line)
-            if match:
-                security = match.group(1).strip()
-                self._log_manual_fix(f"order_target({security}, 0)需要手动转换为api.sell()")
-                return f"# TODO: 转换卖出逻辑\n        # api.sell(account_id, {security}, volume=可卖数量)"
-
-        # order_target_value - 按金额买入
-        if 'order_target_value(' in line:
-            self._log_manual_fix("order_target_value需要手动转换为api.buy()")
-            return f"# TODO: 转换按金额买入逻辑\n        # 原代码: {line}"
-
-        # order_value - 按金额买入
-        if 'order_value(' in line:
-            self._log_manual_fix("order_value需要手动转换为api.buy()")
-            return f"# TODO: 转换按金额买入逻辑\n        # 原代码: {line}"
-
-        # order_target - 调整持仓
-        if 'order_target(' in line:
-            self._log_manual_fix("order_target需要手动转换为api.buy/sell")
-            return f"# TODO: 转换调仓逻辑\n        # 原代码: {line}"
-
-        return line
-
-    def _generate_complete_script(self, converted_code: Dict, analysis: Dict) -> str:
-        """生成完整的EasyXT脚本"""
-
-        # 使用字符串拼接避免f-string中的转义字符问题
-        script_parts = []
-
-        # 文件头
-        script_parts.append('"""')
-        script_parts.append('聚宽策略转EasyXT - 自动生成的策略脚本')
-        script_parts.append(f'转换时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
-        script_parts.append('')
-        script_parts.append('⚠️  重要提示：')
-        script_parts.append('1. 请根据实际需求修改账户ID')
-        script_parts.append('2. 请手动完善标记为TODO的交易逻辑')
-        script_parts.append('3. 请检查并测试数据获取是否正常')
-        script_parts.append('4. 建议先在模拟环境验证策略')
-        script_parts.append('"""')
-        script_parts.append('')
-
-        # 导入模块
-        script_parts.append('# ========== 导入模块 ==========')
-        script_parts.extend(converted_code['imports'])
-        script_parts.append('')
-
-        # 全局配置
-        script_parts.append('# ========== 全局配置 ==========')
-        script_parts.append(f'ACCOUNT_ID = "{self.account_id}"  # TODO: 修改为实际账户ID')
-        script_parts.append('USERDATA_PATH = "D:\\\\你的QMT路径\\\\userdata_mini"  # TODO: 修改为实际路径')
-        script_parts.append('')
-
-        # 全局变量
-        script_parts.append('# ========== 全局变量 ==========')
-        if converted_code['global_vars']:
-            script_parts.extend(converted_code['global_vars'])
-        else:
-            script_parts.append('# 无全局变量')
-        script_parts.append('')
-
-        # 初始化函数
-        script_parts.append('# ========== 初始化函数 ==========')
-        script_parts.append('def initialize():')
-        script_parts.append('    """初始化策略"""')
-        script_parts.append('    print("=" * 60)')
-        script_parts.append('    print("策略初始化开始")')
-        script_parts.append('    print("=" * 60)')
-        script_parts.append('')
-        script_parts.append('    # 创建API实例')
-        script_parts.append('    api = easy_xt.get_api()')
-        script_parts.append('')
-        script_parts.append('    # 初始化数据服务')
-        script_parts.append('    print("正在初始化数据服务...")')
-        script_parts.append('    success = api.init_data()')
-        script_parts.append('    if success:')
-        script_parts.append('        print("✓ 数据服务初始化成功")')
-        script_parts.append('    else:')
-        script_parts.append('        print("✗ 数据服务初始化失败")')
-        script_parts.append('        return None')
-        script_parts.append('')
-
-        # 交易服务初始化
-        if analysis['has_trading']:
-            script_parts.append('    # 初始化交易服务')
-            script_parts.append('    print("正在初始化交易服务...")')
-            script_parts.append('    success = api.init_trade(USERDATA_PATH)')
-            script_parts.append('    if success:')
-            script_parts.append('        print("✓ 交易服务初始化成功")')
-            script_parts.append('    else:')
-            script_parts.append('        print("✗ 交易服务初始化失败")')
-            script_parts.append('        return None')
-            script_parts.append('')
-            script_parts.append('    # 添加交易账户')
-            script_parts.append('    api.add_account(ACCOUNT_ID)')
-            script_parts.append('')
-
-        # 执行初始化逻辑
-        script_parts.append('    # 执行初始化逻辑')
-        if converted_code['initialize_logic']:
-            script_parts.append(converted_code['initialize_logic'])
-        else:
-            script_parts.append('    pass  # 无初始化逻辑')
-        script_parts.append('')
-        script_parts.append('    print("=" * 60)')
-        script_parts.append('    print("策略初始化完成")')
-        script_parts.append('    print("=" * 60)')
-        script_parts.append('')
-        script_parts.append('    return api')
-        script_parts.append('')
-
-        # 主策略逻辑
-        script_parts.append('# ========== 主策略逻辑 ==========')
-        script_parts.append('def run_strategy(api):')
-        script_parts.append('    """')
-        script_parts.append('    主策略循环')
-        script_parts.append('')
-        script_parts.append('    注意：这是简化的单次执行版本')
-        script_parts.append('    如果需要定时运行，请使用定时器或外部调度')
-        script_parts.append('    """')
-        script_parts.append('    print("\\n" + "=" * 60)')
-        script_parts.append('    print("开始执行策略")')
-        script_parts.append('    print("=" * 60)')
-        script_parts.append('')
-        script_parts.append('    try:')
-        if converted_code['main_loop_logic']:
-            script_parts.append(converted_code['main_loop_logic'])
-        else:
-            script_parts.append('        pass  # 无主策略逻辑')
-        script_parts.append('    except Exception as e:')
-        script_parts.append('        print("策略执行出错: " + str(e))')
-        script_parts.append('')
-        script_parts.append('    print("=" * 60)')
-        script_parts.append('    print("策略执行完成")')
-        script_parts.append('    print("=" * 60)')
-        script_parts.append('')
-
-        # 辅助函数
-        script_parts.append('# ========== 辅助函数 ==========')
-        helper_funcs = self._generate_helper_functions(converted_code['helper_functions'])
-        script_parts.append(helper_funcs)
-        script_parts.append('')
-
-        # 主程序入口
-        script_parts.append('# ========== 主程序入口 ==========')
-        script_parts.append('if __name__ == "__main__":')
-        script_parts.append('    try:')
-        script_parts.append('        # 1. 初始化')
-        script_parts.append('        api = initialize()')
-        script_parts.append('        if api is None:')
-        script_parts.append('            print("\\n✗ 初始化失败，程序退出")')
-        script_parts.append('            sys.exit(1)')
-        script_parts.append('')
-        script_parts.append('        # 2. 运行策略')
-        script_parts.append('        run_strategy(api)')
-        script_parts.append('')
-        script_parts.append('        # 3. 如果需要持续运行，可以使用循环')
-        script_parts.append('        # while True:')
-        script_parts.append('        #     run_strategy(api)')
-        script_parts.append('        #     time.sleep(60)  # 每分钟执行一次')
-        script_parts.append('')
-        script_parts.append('    except KeyboardInterrupt:')
-        script_parts.append('        print("\\n\\n用户中断，程序退出")')
-        script_parts.append('    except Exception as e:')
-        script_parts.append('        print("\\n✗ 程序异常: " + str(e))')
-        script_parts.append('        import traceback')
-        script_parts.append('        traceback.print_exc()')
-
-        return '\n'.join(script_parts)
-
-    def _generate_helper_functions(self, helper_functions: List[Dict]) -> str:
-        """生成辅助函数代码"""
-        if not helper_functions:
-            return '# 无辅助函数'
-
-        code_blocks = []
-        for func in helper_functions:
-            func_name = func['name']
-            func_body = func['body']
-
-            code_blocks.append(f"def {func_name}(api):")
-            code_blocks.append(f"    {func_body}")
-            code_blocks.append("")
-
-        return '\n'.join(code_blocks)
-
-    def _log_info(self, message: str):
-        """记录信息日志"""
-        self.conversion_report['infos'].append(message)
-        if self.verbose:
-            print(f"  [INFO] {message}")
-
-    def _log_warning(self, message: str):
-        """记录警告日志"""
-        self.conversion_report['warnings'].append(message)
-        if self.verbose:
-            print(f"  [⚠️] {message}")
-
-    def _log_error(self, message: str):
-        """记录错误日志"""
-        self.conversion_report['errors'].append(message)
-        if self.verbose:
-            print(f"  [❌] {message}")
-
-    def _log_success(self, message: str):
-        """记录成功日志"""
-        self.conversion_report['successes'].append(message)
-        if self.verbose:
-            print(f"  [✅] {message}")
-
-    def _log_api_mapping(self, message: str):
-        """记录API映射"""
-        self.conversion_report['api_mappings'].append(message)
-
-    def _log_manual_fix(self, message: str):
-        """记录需要手动修复的项目"""
-        self.conversion_report['manual_fixes'].append(message)
-        if self.verbose:
-            print(f"  [🔧] {message}")
-
-    def _print_conversion_report(self):
-        """打印转换报告"""
-        print("\n" + "=" * 80)
-        print("📊 转换报告")
-        print("=" * 80)
-
-        if self.conversion_report['api_mappings']:
-            print("\n✅ API映射:")
-            for mapping in self.conversion_report['api_mappings'][:20]:  # 限制显示数量
-                print(f"   - {mapping}")
-            if len(self.conversion_report['api_mappings']) > 20:
-                print(f"   ... 还有 {len(self.conversion_report['api_mappings']) - 20} 个映射")
-
-        if self.conversion_report['warnings']:
-            print("\n⚠️  警告:")
-            for warning in self.conversion_report['warnings'][:10]:
-                print(f"   - {warning}")
-            if len(self.conversion_report['warnings']) > 10:
-                print(f"   ... 还有 {len(self.conversion_report['warnings']) - 10} 个警告")
-
-        if self.conversion_report['manual_fixes']:
-            print("\n🔧 需要手动修复:")
-            for fix in self.conversion_report['manual_fixes'][:10]:
-                print(f"   - {fix}")
-            if len(self.conversion_report['manual_fixes']) > 10:
-                print(f"   ... 还有 {len(self.conversion_report['manual_fixes']) - 10} 个需要修复")
-
-        if self.conversion_report['errors']:
-            print("\n❌ 错误:")
-            for error in self.conversion_report['errors']:
-                print(f"   - {error}")
-
-        print("\n" + "=" * 80)
-        print("✅ 转换完成！")
-        print("=" * 80)
-        print("\n📋 后续步骤：")
-        print("1. 检查生成的代码，特别是标记为TODO的部分")
-        print("2. 修改账户ID和路径配置")
-        print("3. 手动完善交易逻辑（buy/sell）")
-        print("4. 在模拟环境测试策略")
-        print("5. 验证通过后才能用于实盘")
-        print("=" * 80 + "\n")
+    def _print_report(self):
+        report = self.conversion_report
+        print("\n" + "=" * 70)
+        print("📊 转换报告 V2.0")
+        print("=" * 70)
+        for title, key in [
+            ('✅ API映射', 'api_mappings'),
+            ('✏️ 代码变更', 'changes'),
+            ('📦 注入函数', 'added_functions'),
+            ('⚠️ 警告', 'warnings'),
+        ]:
+            items = report.get(key, [])
+            if items:
+                print(f"\n{title} ({len(items)}):")
+                for item in items[:30]:
+                    print(f"   - {item}")
+                if len(items) > 30:
+                    print(f"   ... 还有 {len(items) - 30} 项")
+        print("\n" + "=" * 70)
 
     def get_conversion_report(self) -> Dict:
-        """获取转换报告"""
         return self.conversion_report
-
-
-# ========== 使用示例 ==========
-if __name__ == "__main__":
-    # 示例聚宽代码
-    sample_jq_code = """
-import jqdata
-
-def initialize(context):
-    # 设置股票池
-    g.stock = '000001.XSHE'
-    g.buy_threshold = 1.05
-    g.sell_threshold = 0.95
-
-    # 设置基准
-    set_benchmark('000300.XSHG')
-
-    # 设置定时任务
-    run_daily(check_strategy, time='9:30')
-
-def check_strategy(context):
-    # 获取历史数据
-    hist_data = attribute_history(g.stock, 5, unit='1d',
-                                  fields=['close'], df=True)
-
-    # 计算均线
-    ma5 = hist_data['close'].mean()
-
-    # 获取当前价格
-    current_data = get_current_data()
-    current_price = current_data[g.stock].last_price
-
-    # 获取可用资金
-    cash = context.portfolio.available_cash
-
-    # 买入逻辑
-    if current_price > ma5 * g.buy_threshold and cash > 0:
-        order_value(g.stock, cash)
-        log.info(f"买入 {g.stock}")
-
-    # 卖出逻辑
-    elif current_price < ma5 * g.sell_threshold:
-        order_target(g.stock, 0)
-        log.info(f"卖出 {g.stock}")
-
-def handle_data(context, data):
-    pass
-"""
-
-    # 创建转换器
-    converter = JQToEasyXTConverter(verbose=True)
-
-    # 转换代码
-    converted_code = converter.convert(
-        sample_jq_code,
-        output_file='easyxt_strategy_converted.py'
-    )
-
-    print("\n✅ 转换完成！生成的文件：easyxt_strategy_converted.py")
