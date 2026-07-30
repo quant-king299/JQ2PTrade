@@ -393,6 +393,12 @@ class JQToPtradeUnifiedConverter:
         # 32. v5.3: get_stock_info().display_name → Tushare fallback
         result = self._fix_get_stock_info_display_name(result)
 
+        # 33. v5.3: 性能优化——停牌检查批量化（168次API→1次）
+        result = self._optimize_batch_suspended(result)
+
+        # 34. v5.3: 性能优化——get_security_name移除Tushare API调用
+        result = self._optimize_get_security_name(result)
+
         return result
 
     def _handle_get_current_data(self, code: str, strategy_type: StrategyType) -> str:
@@ -1661,10 +1667,8 @@ def _get_market_cap_ts(stock_list, date_str):
             return code
 
         times = (
-            "'09:35','09:40','09:50','10:00','10:10','10:20',"
-            "'10:30','10:40','10:50','11:00','11:10','11:20',"
-            "'13:05','13:10','13:20','13:30','13:40','13:50',"
-            "'14:00','14:10','14:20','14:30','14:40','14:50'"
+            "'09:40','10:10','10:40','11:10',"
+            "'13:10','13:40','14:10','14:40'"
         )
 
         def _replace_every_bar(match):
@@ -1871,6 +1875,83 @@ def get_Ashares(types=None, date=None):
             code = re.sub(pattern, replacement, code)
             self.conversion_report['changes'].append('get_stock_info().display_name → Tushare fallback')
 
+        return code
+
+    def _optimize_batch_suspended(self, code: str) -> str:
+        """v5.3性能优化：停牌检查批量化（168次get_price→1次）"""
+        if 'is_temporarily_suspended' not in code:
+            return code
+        if '_batch_check_suspended' in code:
+            return code
+
+        batch_func = '''
+def _batch_check_suspended(etf_list, context, minute_count=10):
+    """批量检查ETF是否停牌——1次API调用替代N次"""
+    if not etf_list:
+        return set()
+    try:
+        minute_data = _price(
+            etf_list,
+            end_date=context.current_dt.strftime('%Y%m%d'),
+            count=minute_count,
+            frequency='1m',
+            fields=['volume']
+        )
+        if minute_data is None or minute_data.empty:
+            return set(etf_list)
+        suspended = set()
+        for code, group in minute_data.groupby('code'):
+            if (group['volume'] == 0).all():
+                suspended.add(code)
+        codes_with_data = set(minute_data['code'].unique())
+        suspended.update(set(etf_list) - codes_with_data)
+        return suspended
+    except Exception:
+        return set()
+'''
+        code = re.sub(
+            r'(close_pivot\s*=\s*hist_df\.pivot\([^)]+\))',
+            batch_func + r'\n\1',
+            code
+        )
+        self.conversion_report['changes'].append('性能优化：注入批量停牌检查_batch_check_suspended')
+
+        # 在get_final_ranked_etfs中替换逐个is_temporarily_suspended为批量
+        code = re.sub(
+            r'(\s+)if is_temporarily_suspended\((\w+),\s*context\):\s*\n\s+[^\n]+\n\s+continue',
+            r'\1if \2 in suspended_set:\n\1    continue',
+            code
+        )
+
+        # 在遍历循环前添加批量检查调用
+        code = re.sub(
+            r'(# =+\s*遍历ETF计算动量得分\s*=+\s*)',
+            r'suspended_set = _batch_check_suspended(etf_set, context)\n    \1',
+            code
+        )
+        return code
+
+    def _optimize_get_security_name(self, code: str) -> str:
+        """v5.3性能优化：get_security_name移除Tushare API调用（使用etf_names_dict缓存）"""
+        if 'def get_security_name' not in code:
+            return code
+        if 'return security  # 无缓存时直接返回代码' in code:
+            return code  # already optimized
+
+        # 替换get_security_name函数体为轻量版
+        old_func = r'(def get_security_name\((\w+)\):.*?)(?=\n\ndef|\n# ===|$)'
+        new_func = '''def get_security_name(\\2):
+    """获取ETF名称（从缓存读取，避免Tushare API调用）"""
+    try:
+        if hasattr(context, 'etf_names_dict') and \\2 in context.etf_names_dict:
+            return context.etf_names_dict[\\2]
+    except Exception:
+        pass
+    return \\2'''
+        new_code = re.sub(old_func, new_func, code, flags=re.DOTALL)
+        if new_code != code:
+            code = new_code
+            self.conversion_report['changes'].append('性能优化：get_security_name移除Tushare API调用')
         return code
 
     def _add_helper_functions(self, code: str, analysis: Dict) -> str:
