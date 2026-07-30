@@ -1,6 +1,18 @@
 """
-聚宽到Ptrade统一转换器 v5.2 (全面JQ→PTrade兼容)
+聚宽到Ptrade统一转换器 v5.3 (完整JQ→PTrade兼容)
 更新说明:
+- ✅ v5.3: 一键转换——修复所有已发现的兼容性差异
+  - time='every_bar' → 多时段run_daily（PTrade不支持every_bar）
+  - attribute_history → get_price 映射
+  - 持仓属性映射: total_amount→amount, closeable_amount→enable_amount, avg_cost→cost_basis, price→last_sale_price
+  - context.portfolio.available_cash → cash
+  - record() → log.info()（PTrade无record）
+  - get_price 列名: 自动注入_price包装器(date/index→time)
+  - apply_filters(): 自动添加context参数
+  - get_Ashares(): 注入Tushare兼容函数
+  - get_stock_info().display_name: Tushare fallback
+  - get_current_data_compat(): 自动传递stock_list参数
+  - datetime.date → strftime: 增强get_trade_days等日期处理
 - ✅ v5.2: 反向集成四大搅屎棍策略调试发现的所有问题
   - get_industry(): 改用tushare申万行业数据，PTrade代码格式(.SZ/.SS)
   - get_stock_info(): 返回嵌套dict，start_date→listed_date+日期解析
@@ -88,6 +100,7 @@ class JQToPtradeUnifiedConverter:
         self.api_mapping = {
             'get_price': 'get_price',
             'get_history': 'get_history',
+            'attribute_history': 'get_price',
             'get_bars': 'get_history',
             'history': 'get_history',  # 聚宽的history()函数
             'get_current_data': 'get_snapshot',
@@ -141,8 +154,8 @@ class JQToPtradeUnifiedConverter:
 
         if self.verbose:
             print("=" * 60)
-            print("聚宽到Ptrade统一转换器 v5.1 (全面JQ→PTrade兼容)")
-            print("反向集成PTrade运行调试发现的所有问题")
+            print("聚宽到Ptrade统一转换器 v5.3 (一键转换完整兼容)")
+            print("time='every_bar'/持仓属性/列名/G对象/record等全面适配")
             print("=" * 60)
 
         # 1. 分析代码
@@ -355,6 +368,30 @@ class JQToPtradeUnifiedConverter:
 
         # 24. v5.2: close_position(position) → close_position(stock)
         result = self._convert_close_position(result)
+
+        # 25. v5.3: time='every_bar' → 多时段run_daily
+        result = self._convert_every_bar(result)
+
+        # 26. v5.3: 持仓属性映射 (total_amount→amount, closeable_amount→enable_amount, avg_cost→cost_basis, price→last_sale_price)
+        result = self._convert_position_attrs(result)
+
+        # 27. v5.3: context.portfolio.available_cash → cash
+        result = self._convert_portfolio_cash(result)
+
+        # 28. v5.3: record() → log.info()
+        result = self._convert_record_to_log(result)
+
+        # 29. v5.3: apply_filters()缺少context参数 → 自动添加
+        result = self._fix_apply_filters(result)
+
+        # 30. v5.3: 注入_price包装器 (统一get_price列名)
+        result = self._inject_price_wrapper(result, analysis)
+
+        # 31. v5.3: 注入get_Ashares Tushare兼容函数
+        result = self._inject_tushare_get_ashares(result, analysis)
+
+        # 32. v5.3: get_stock_info().display_name → Tushare fallback
+        result = self._fix_get_stock_info_display_name(result)
 
         return result
 
@@ -924,8 +961,11 @@ def get_current_data_compat(security_list=None):
 
 
     def _convert_global_variable(self, code: str) -> str:
-        """转换全局变量"""
+        """转换全局变量 g → context"""
         code = re.sub(r'\bg\.', 'context.', code)
+        # 特殊处理 hasattr(g, xxx) 和 getattr(g, xxx)
+        code = re.sub(r'\bhasattr\s*\(\s*g\s*,', 'hasattr(context,', code)
+        code = re.sub(r'\bgetattr\s*\(\s*g\s*,', 'getattr(context,', code)
         code = re.sub(r'context\.(info|debug|warn|error)\s*\(', r'log.\1(', code)
         return code
 
@@ -1098,12 +1138,11 @@ def get_current_data_compat(security_list=None):
     def _fix_date_args(self, code: str) -> str:
         """修复日期参数: datetime.date对象 → 字符串格式
 
-        PTrade的get_price/get_index_stocks等要求字符串日期，不接受datetime.date
+        PTrade的get_price/get_index_stocks/get_trade_days等要求字符串日期
         """
         changes = 0
 
         # get_index_stocks(code, date_obj) → get_index_stocks(code, date_obj.strftime('%Y%m%d'))
-        # 匹配第二个参数是变量名(非字符串)的情况
         new_code = re.sub(
             r"(get_index_stocks\s*\(\s*['\"][^'\"]+['\"](?:\.(?:XSHG|XSHE|SS|SZ))?\s*,\s*)(\w+(?:\.\w+)*)\s*\)",
             lambda m: f"{m.group(1)}{m.group(2)}.strftime('%Y%m%d'))" if '.strftime' not in m.group(2) else m.group(0),
@@ -1112,15 +1151,16 @@ def get_current_data_compat(security_list=None):
         if new_code != code:
             changes += 1
 
-        # get_price(..., end_date=context.previous_date, ...) → .strftime('%Y%m%d')
-        # 只对 context.previous_date、yesterday 和 now_time 变量添加转换
-        for date_var in ['context.previous_date', 'yesterday', 'now_time', 'context.current_dt']:
-            pattern = rf"(end_date\s*=\s*{re.escape(date_var)})(\s*[,)])"
-            replacement = rf"end_date={date_var}.strftime('%Y%m%d')\2"
-            new_code2 = re.sub(pattern, replacement, new_code)
-            if new_code2 != new_code:
-                new_code = new_code2
-                changes += 1
+        # get_price/get_trade_days: end_date/start_date → .strftime('%Y%m%d')
+        for date_var in ['context.previous_date', 'yesterday', 'now_time', 'context.current_dt',
+                         'today', 'end_date', 'start_day', 'context.weak_start_date']:
+            for param in ['end_date', 'start_date']:
+                pattern = rf"({param}\s*=\s*{re.escape(date_var)})(\s*[,)])"
+                replacement = rf"{param}={date_var}.strftime('%Y%m%d')\2"
+                new_code2 = re.sub(pattern, replacement, new_code)
+                if new_code2 != new_code:
+                    new_code = new_code2
+                    changes += 1
 
         if changes > 0:
             self.conversion_report['changes'].append(
@@ -1611,6 +1651,228 @@ def _get_market_cap_ts(stock_list, date_str):
         )
         return code
 
+    # ============================================================
+    # v5.3 新增方法
+    # ============================================================
+
+    def _convert_every_bar(self, code: str) -> str:
+        """v5.3: time='every_bar' → 多时段run_daily（PTrade不支持every_bar）"""
+        if "'every_bar'" not in code and '"every_bar"' not in code:
+            return code
+
+        times = (
+            "'09:35','09:40','09:50','10:00','10:10','10:20',"
+            "'10:30','10:40','10:50','11:00','11:10','11:20',"
+            "'13:05','13:10','13:20','13:30','13:40','13:50',"
+            "'14:00','14:10','14:20','14:30','14:40','14:50'"
+        )
+
+        def _replace_every_bar(match):
+            func_name = match.group(1).strip()
+            func_name = func_name.replace('context,', '').replace('context', '').strip()
+            indent = match.group(0)[:len(match.group(0)) - len(match.group(0).lstrip())] if match.group(0).startswith(' ') else '    '
+            lines = [f'{indent}# PTrade不支持time=every_bar，改为多时段高频执行']
+            lines.append(f'{indent}for _time in [{times}]:')
+            lines.append(f'{indent}    run_daily(context, {func_name}, time=_time)')
+            return '\n'.join(lines)
+
+        # 匹配 run_daily(context, func, time='every_bar') 或 run_daily(func, time='every_bar')
+        patterns = [
+            r"run_daily\s*\(\s*context\s*,\s*(\w+)\s*,\s*time\s*=\s*['\"]every_bar['\"]\s*\)",
+            r"run_daily\s*\(\s*(\w+)\s*,\s*time\s*=\s*['\"]every_bar['\"]\s*\)",
+        ]
+        for pat in patterns:
+            if re.search(pat, code):
+                code = re.sub(pat, _replace_every_bar, code)
+                self.conversion_report['changes'].append("time='every_bar' → 多时段run_daily")
+                break
+
+        return code
+
+    def _convert_position_attrs(self, code: str) -> str:
+        """v5.3: 持仓属性映射 total_amount→amount, closeable_amount→enable_amount, avg_cost→cost_basis, price→last_sale_price"""
+        mappings = [
+            (r'\.total_amount\b', '.amount', 'position.total_amount → amount'),
+            (r'\.closeable_amount\b', '.enable_amount', 'position.closeable_amount → enable_amount'),
+            (r'\.avg_cost\b', '.cost_basis', 'position.avg_cost → cost_basis'),
+            (r'\bposition\.price\b', 'position.last_sale_price', 'position.price → last_sale_price'),
+        ]
+        for pattern, replacement, desc in mappings:
+            if re.search(pattern, code):
+                code = re.sub(pattern, replacement, code)
+                self.conversion_report['changes'].append(desc)
+        return code
+
+    def _convert_portfolio_cash(self, code: str) -> str:
+        """v5.3: context.portfolio.available_cash → context.portfolio.cash"""
+        if 'context.portfolio.available_cash' in code:
+            code = code.replace('context.portfolio.available_cash', 'context.portfolio.cash')
+            self.conversion_report['changes'].append('available_cash → cash')
+        return code
+
+    def _convert_record_to_log(self, code: str) -> str:
+        """v5.3: record() → log.info()（PTrade无record函数）"""
+        if not re.search(r'\brecord\s*\(', code):
+            return code
+
+        def _replace_record(match):
+            args = match.group(1)
+            return f'log.info({args})'
+
+        code = re.sub(r'\brecord\s*\(([^)]+)\)', _replace_record, code)
+        self.conversion_report['changes'].append('record() → log.info()')
+        return code
+
+    def _fix_apply_filters(self, code: str) -> str:
+        """v5.3: apply_filters(metrics_list) → apply_filters(metrics_list, context)"""
+        if not re.search(r'def\s+apply_filters\s*\(', code):
+            return code
+
+        # 函数签名添加context参数
+        code = re.sub(
+            r'def\s+apply_filters\s*\(\s*(\w+)\s*\)\s*:',
+            r'def apply_filters(\1, context):',
+            code
+        )
+
+        # 调用处添加context参数
+        code = re.sub(
+            r'apply_filters\s*\(\s*(\w+)\s*\)(?!\s*,)',
+            r'apply_filters(\1, context)',
+            code
+        )
+
+        self.conversion_report['changes'].append('apply_filters() → 添加context参数')
+        return code
+
+    def _inject_price_wrapper(self, code: str, analysis: Dict) -> str:
+        """v5.3: 注入_price包装器，统一get_price返回的列名（date→time）"""
+        if 'def _price' in code or 'def _normalize_price_df' in code:
+            return code
+        if 'get_price' not in code and '_price' not in code:
+            return code
+
+        wrapper = '''
+def _normalize_price_df(df):
+    """PTrade get_price的DataFrame日期可能在index或列中,统一转为有'time'列的格式"""
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    import pandas as pd
+    if 'code' in df.columns and isinstance(df.index, pd.DatetimeIndex):
+        df = df.reset_index()
+    if 'time' not in df.columns:
+        for col in ['index', 'datetime', 'date']:
+            if col in df.columns:
+                df = df.rename(columns={col: 'time'})
+                break
+    return df
+
+_price_raw = get_price
+def _price(*args, **kwargs):
+    df = _price_raw(*args, **kwargs)
+    return _normalize_price_df(df)
+
+# 用_price替换所有get_price调用（保留原get_price给_price_raw用）
+get_price = _price
+'''
+        # 在第一个# ======分隔线之后插入
+        separator_match = re.search(r'# =+\n', code)
+        if separator_match:
+            insert_pos = separator_match.end()
+        else:
+            # 在imports之后插入
+            lines = code.split('\n')
+            insert_idx = 0
+            for i, line in enumerate(lines):
+                if line.startswith('import ') or line.startswith('from '):
+                    insert_idx = i + 1
+            insert_pos = 0
+            for i in range(insert_idx):
+                insert_pos += len(lines[i]) + 1
+        if insert_pos:
+            code = code[:insert_pos] + wrapper + code[insert_pos:]
+            self.conversion_report['changes'].append('注入_price包装器 (get_price列名兼容)')
+        return code
+
+    def _inject_tushare_get_ashares(self, code: str, analysis: Dict) -> str:
+        """v5.3: 注入get_Ashares Tushare兼容函数"""
+        if 'def get_Ashares' in code:
+            return code
+        if 'get_Ashares' not in code:
+            return code
+
+        func = '''
+def get_Ashares(types=None, date=None):
+    """替代聚宽get_Ashares() — 基于Tushare获取证券列表"""
+    import pandas as pd
+    try:
+        if types is None or 'stock' in types:
+            df = _ts_pro.stock_basic(list_status='L', fields='ts_code,symbol,name,area,industry,list_date')
+        elif 'etf' in types:
+            df = _ts_pro.fund_basic(market='E', fields='ts_code,symbol,name,fund_type,issue_date')
+        elif 'index' in types:
+            df1 = _ts_pro.index_basic(market='SSE', fields='ts_code,name,publish_date')
+            df2 = _ts_pro.index_basic(market='SZSE', fields='ts_code,name,publish_date')
+            df = pd.concat([df1, df2], ignore_index=True) if df2 is not None and not df2.empty else df1
+        else:
+            result = pd.DataFrame()
+            result['display_name'] = []
+            return result
+        if df is not None and not df.empty:
+            jq_codes = _batch_jq_codes(df['ts_code'].tolist())
+            df.index = jq_codes
+            if 'name' in df.columns:
+                df['display_name'] = df['name'].fillna(df.index.to_series())
+            else:
+                df['display_name'] = df.index.tolist()
+            return df
+        result = pd.DataFrame()
+        result['display_name'] = []
+        return result
+    except Exception:
+        result = pd.DataFrame()
+        result['display_name'] = []
+        return result
+'''
+        # 在get_all_securities之后插入
+        if 'def get_all_securities' in code or 'def _batch_jq_codes' in code:
+            insert_after = code.find("return result\n") or code.find("# ======")
+            if insert_after > 0:
+                code = code[:insert_after + len("return result\n")] + func + code[insert_after + len("return result\n"):]
+        else:
+            # 在第一个# ======分隔线之前插入
+            separator_match = re.search(r'# =+\n', code)
+            if separator_match:
+                code = code[:separator_match.start()] + func + '\n' + code[separator_match.start():]
+
+        self.conversion_report['changes'].append('注入get_Ashares Tushare兼容函数')
+        return code
+
+    def _fix_get_stock_info_display_name(self, code: str) -> str:
+        """v5.3: get_stock_info(security).display_name → Tushare fallback"""
+        if 'get_stock_info' not in code or '.display_name' not in code:
+            return code
+
+        # 替换 get_stock_info(x).display_name 为 Tushare查询
+        pattern = r"return\s+get_stock_info\s*\((\w+)\)\.display_name"
+        replacement = (
+            r'''# PTrade可能没有get_stock_info，用Tushare查询或返回代码本身
+        try:
+            ts_code = _ts_code_convert(\1)
+            df = _ts_pro.stock_basic(ts_code=ts_code, fields='ts_code,name')
+            if df is not None and not df.empty:
+                return df.iloc[0]['name']
+        except Exception:
+            pass
+        return \1'''
+        )
+        if re.search(pattern, code):
+            code = re.sub(pattern, replacement, code)
+            self.conversion_report['changes'].append('get_stock_info().display_name → Tushare fallback')
+
+        return code
+
     def _add_helper_functions(self, code: str, analysis: Dict) -> str:
         """添加辅助函数 - 只在代码中实际使用时才添加"""
         # 检查转换过程中是否实际使用了MACD/RSI
@@ -1808,7 +2070,7 @@ def get_rsi_value(context, security, period=14):
         # 添加头部说明
         header = f'''# 聚宽策略转Ptrade - {strategy_type.value.upper()}版本
 # 转换时间: {self._get_timestamp()}
-# 转换器版本: v5.2 - 反向集成PTrade回测调试修复
+# 转换器版本: v5.3 - 一键转换完整兼容
 
 '''
 
