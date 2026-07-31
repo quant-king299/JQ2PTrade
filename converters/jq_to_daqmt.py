@@ -62,8 +62,8 @@ class JQToDaQmtConverter:
 
         # log 映射
         self.log_mapping = {
-            'log.info': 'print', 'log.warn': 'print',
-            'log.error': 'print', 'log.debug': 'print',
+            'log.info': 'log_info', 'log.warn': 'log_info',
+            'log.error': 'log_info', 'log.debug': 'log_info',
         }
 
         # 不支持的 API → 直接移除
@@ -104,50 +104,40 @@ class JQToDaQmtConverter:
         # Step 3: 提取函数体和全局变量
         extracted = self._extract_code_blocks(code)
 
-        # 从 initialize() 提取 g.xxx 全局变量（支持多行列表/字典赋值）
+        # 从 initialize() 提取全局变量到模块级 + 保留非赋值行注入 init()
+        init_body_lines = []
         if 'initialize' in extracted['functions']:
             init_lines = extracted['functions']['initialize']['body'].split('\n')
             i = 0
             while i < len(init_lines):
                 line = init_lines[i]
-                g_match = re.match(r'\s*g\.(\w+)\s*=\s*(.+)', line)
+                g_match = re.match(r'(\s*)g\.(\w+)\s*=\s*(.*)', line)
                 if g_match:
-                    var_name = g_match.group(1)
-                    var_value = g_match.group(2).strip()
-                    # 检测多行赋值：以 [ 或 ( 或 { 开头但未在同一行闭合
-                    if var_value.endswith('[') or var_value.endswith('(') or var_value.endswith('{'):
-                        bracket = var_value[-1]
-                        close_bracket = {']': ']', '(': ')', '{': '}'}[bracket]
-                        # 收集后续行直到括号闭合
+                    var_name = g_match.group(2)
+                    var_value = g_match.group(3).strip()
+                    # 检测多行赋值
+                    clean_val = var_value.split('#')[0].rstrip()
+                    if clean_val and clean_val[-1] in ['[', '(', '{']:
+                        close_b = {'[': ']', '(': ')', '{': '}'}[clean_val[-1]]
                         j = i + 1
                         while j < len(init_lines):
-                            cont_line = init_lines[j].strip()
                             var_value += '\n' + init_lines[j].rstrip()
-                            if cont_line.startswith(close_bracket) or cont_line == close_bracket:
-                                break
-                            if close_bracket in cont_line:
+                            if init_lines[j].strip().startswith(close_b):
                                 break
                             j += 1
-                        i = j  # 跳到闭合行
-                    full_line = f'gvar.{var_name} = {var_value}'
+                        i = j
+                    var_value = re.sub(r'\bg\.(\w+)', r'gvar.\1', var_value)
+                    full = f'gvar.{var_name} = {var_value}'
                     if not any(v.startswith(f'gvar.{var_name} =') for v in extracted['global_vars']):
-                        extracted['global_vars'].append(self._standardize_codes(full_line))
+                        extracted['global_vars'].append(self._standardize_codes(full))
                         self._add_mapping(f'g.{var_name} → gvar.{var_name}')
+                else:
+                    line = re.sub(r'\bg\.(\w+)', r'gvar.\1', line)
+                    init_body_lines.append(line)
                 i += 1
-            del extracted['functions']['initialize']
-
-        # 对全局变量做代码标准化，同时过滤掉孤立的多行续行
-        standardized = []
-        for v in extracted['global_vars']:
-            v = self._standardize_codes(v)
-            stripped = v.strip()
-            # 过滤掉纯续行（以引号或逗号开头的孤立行）
-            if stripped.startswith("'") or stripped.startswith('"') or stripped.startswith(',') or stripped.startswith(']') or stripped.startswith(')'):
-                continue
-            if stripped == '' or stripped.startswith('#'):
-                continue
-            standardized.append(v)
-        extracted['global_vars'] = standardized
+            body_text = '\n'.join(init_body_lines)
+            body_text = body_text.replace('gvar.gvar.', 'gvar.')
+            extracted['functions']['initialize']['body'] = body_text
 
         # Step 4: 对每个函数体应用转换管道
         all_func_names = set(extracted['functions'].keys())
@@ -308,12 +298,9 @@ class JQToDaQmtConverter:
                 body_lines = []
                 i += 1
                 while i < len(lines):
-                    stripped_inner = lines[i].strip()
-                    if stripped_inner and re.match(r'def\s+\w+\s*\(', lines[i]):
+                    # 只在遇到下一个 def 时才结束 body
+                    if re.match(r'^def\s+\w+\s*\(', lines[i]):
                         break
-                    if stripped_inner and not lines[i].startswith(' ') and not lines[i].startswith('\t'):
-                        if not stripped_inner.startswith('@'):
-                            break
                     body_lines.append(lines[i])
                     i += 1
 
@@ -325,12 +312,17 @@ class JQToDaQmtConverter:
             else:
                 stripped = line.strip()
                 # 过滤掉多行赋值的续行（以引号/逗号/方括号开头的缩进行）
-                if stripped.startswith("'") or stripped.startswith('"'):
-                    pass  # skip continuation
-                elif stripped.startswith(',') or stripped.startswith(']') or stripped.startswith(')'):
-                    pass  # skip continuation
+                if line.startswith(' ') or line.startswith('\t'):
+                    if stripped.startswith("'") or stripped.startswith('"'):
+                        pass  # skip continuation
+                    elif stripped.startswith(',') or stripped.startswith(']') or stripped.startswith(')'):
+                        pass  # skip continuation
+                    elif stripped.startswith('#') or stripped == '':
+                        pass  # skip indented comments/blanks
+                    else:
+                        global_lines.append(line)  # keep other indented lines
                 elif stripped.startswith('#') or stripped == '':
-                    global_lines.append(line)  # keep comments and blanks
+                    global_lines.append(line)
                 elif stripped.startswith('import ') or stripped.startswith('from '):
                     global_lines.append(line)
                 else:
@@ -348,10 +340,15 @@ class JQToDaQmtConverter:
         for jq_log, daqmt_log in self.log_mapping.items():
             body = re.sub(rf'\b{re.escape(jq_log)}\s*\(', f'{daqmt_log}(', body)
 
-        # g.xxx → gvar.xxx
+        # g.xxx → gvar.xxx (but not gvar.gvar.)
         body = re.sub(r'\bg\.(\w+)', r'gvar.\1', body)
-        # 但保留 gvar.gvar. → gvar.
         body = body.replace('gvar.gvar.', 'gvar.')
+
+        # portfolio.xxx → _get_portfolio(ContextInfo).xxx
+        body = re.sub(r'\bportfolio\.', '_get_portfolio(ContextInfo).', body)
+
+        # _get_all_securities( → get_all_securities(
+        body = body.replace('_get_all_securities(', 'get_all_securities(')
 
         # API 名称映射（最长优先）
         sorted_apis = sorted(self.api_mapping.items(), key=lambda x: -len(x[0]))
@@ -759,11 +756,52 @@ class JQToDaQmtConverter:
             '',
         ])
 
+        # _get_position_dict + _PortfolioCompat (trading strategies)
+        if analysis.get('has_trading'):
+            parts.extend([
+                'def _get_position_dict(ContextInfo):',
+                '    """获取持仓字典 {code: Pos对象}"""',
+                '    import types',
+                '    result = {}',
+                '    for p in get_trade_detail_data(ACCOUNT_ID, ACCOUNT_TYPE, "POSITION"):',
+                '        code = p.m_strInstrumentID + "." + p.m_strExchangeID',
+                '        pos = types.SimpleNamespace()',
+                '        pos.security = code',
+                '        pos.total_amount = p.m_nVolume',
+                '        pos.closeable_amount = p.m_nCanUseVolume',
+                '        pos.avg_cost = p.m_dOpenPrice',
+                '        pos.price = 0',
+                '        pos.value = p.m_dMarketValue',
+                '        result[code] = pos',
+                '    return result',
+                '',
+                'class _PortfolioCompat:',
+                '    """聚宽 portfolio 兼容对象"""',
+                '    def __init__(self, ContextInfo):',
+                '        self._ctx = ContextInfo',
+                '        self._acct = get_trade_detail_data(ACCOUNT_ID, ACCOUNT_TYPE, "ACCOUNT")[0]',
+                '    @property',
+                '    def total_value(self):',
+                '        return self._acct.m_dBalance',
+                '    @property',
+                '    def available_cash(self):',
+                '        return self._acct.m_dAvailable',
+                '    @property',
+                '    def positions(self):',
+                '        return _get_position_dict(self._ctx)',
+                '',
+                'def _get_portfolio(ContextInfo):',
+                '    return _PortfolioCompat(ContextInfo)',
+                '',
+            ])
+
         if analysis.get('uses_get_current_data'):
             parts.extend([
-                'def _get_current_data_compat(codes):',
+                'def _get_current_data_compat(codes=None):',
                 '    """兼容聚宽 get_current_data 的数据结构"""',
                 '    _result = {}',
+                '    if codes is None:',
+                '        return _result',
                 '    _ticks = ContextInfo.get_full_tick(codes)',
                 '    for _code, _tick in _ticks.items():',
                 '        if _tick:',
@@ -819,8 +857,10 @@ class JQToDaQmtConverter:
         parts.append('')
 
         for func_name, func_info in functions.items():
-            if func_name in ('initialize', 'handle_data'):
-                continue
+            if func_name in ('initialize',):
+                continue  # 已注入 init()
+            if func_name in ('handle_data',):
+                continue  # 已注入 handlebar
             body = func_info['body']
             params = func_info['params']
             parts.append(f'def {func_name}({params}):')
@@ -845,6 +885,31 @@ class JQToDaQmtConverter:
         parts.append('    gvar.is_backtest = ContextInfo.do_back_test')
         parts.append('    gvar.quick_trade = 0 if gvar.is_backtest else 1')
         parts.append(f"    print(f'{{STRATEGY_NAME}}: {{\"回测\" if gvar.is_backtest else \"实盘\"}}模式')")
+        parts.append('')
+
+        # 注入 initialize() 非赋值行（run_daily / log.info 等）
+        if 'initialize' in functions:
+            init_body = functions['initialize']['body']
+            if init_body.strip():
+                parts.append('    # ===== 原聚宽 initialize() =====')
+                for line in init_body.split('\n'):
+                    stripped = line.strip()
+                    # 跳过不支持的API
+                    skip = False
+                    for api in self.unsupported_apis + self.comment_apis:
+                        if stripped.startswith(api):
+                            parts.append(f'    # {stripped}  # 大QMT不支持，已移除')
+                            skip = True
+                            break
+                    if skip:
+                        continue
+                    if stripped and not stripped.startswith('#'):
+                        parts.append(f'    {line}' if not line.startswith('    ') else line)
+                    elif stripped.startswith('#'):
+                        parts.append(line)
+                    else:
+                        parts.append('')
+                parts.append('')
         parts.append('')
         # V2 实盘基础设施初始化
         if analysis.get('has_trading'):
