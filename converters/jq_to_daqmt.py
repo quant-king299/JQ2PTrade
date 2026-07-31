@@ -751,9 +751,16 @@ class JQToDaQmtConverter:
             try:
                 tushare_code = _get_tushare_injection(tushare_funcs, tushare_token='')
                 if tushare_code:
+                    # 修正 tushare 初始化：使用 TOKEN 变量而非硬编码
+                    tushare_code = tushare_code.replace(
+                        "ts.set_token('test_token')",
+                        "ts.set_token(TOKEN)")
+                    tushare_code = tushare_code.replace(
+                        '_ts_pro = ts.pro_api()',
+                        'pro = ts.pro_api()')
                     parts.append(tushare_code)
                     parts.append('')
-                    self._add_function('tushare 数据函数注入')
+                    self._add_change('注入 tushare 数据函数（使用 TOKEN 配置）')
             except Exception:
                 pass
 
@@ -882,7 +889,7 @@ class JQToDaQmtConverter:
         parts.append('# 转换信息')
         parts.append('# ========================================')
         parts.append(f"# 转换时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        parts.append(f'# 转换器版本: JQToDaQmtConverter V1.0')
+        parts.append(f'# 转换器版本: JQToDaQmtConverter V3.0')
         parts.append('# 原始平台: 聚宽 (JoinQuant)')
         parts.append('# 目标平台: 大QMT (内置 Python 策略引擎)')
         if analysis['timing_functions']:
