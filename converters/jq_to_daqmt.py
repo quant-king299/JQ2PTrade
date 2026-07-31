@@ -664,6 +664,14 @@ class JQToDaQmtConverter:
             "TOKEN = '请填入自己Tushare的token'  # 使用tushare数据函数时必填",
             '',
             '# ========================================',
+            '# 首次使用：安装 tushare 到大QMT内置Python',
+            '# ========================================',
+            '# 大QMT内置Python默认不包含tushare，需手动安装一次：',
+            '#   打开命令行，执行（路径改为你的QMT安装目录）：',
+            '#   "D:\\国金QMT交易端模拟\\bin.x64\\python.exe" -m pip install tushare',
+            '# 安装完成后重启大QMT即可',
+            '',
+            '# ========================================',
             '# passorder 下单常量（勿修改）',
             '# ========================================',
             'OPTYPE_BUY = 23',
@@ -791,7 +799,7 @@ class JQToDaQmtConverter:
             try:
                 tushare_code = _get_tushare_injection(tushare_funcs, tushare_token='')
                 if tushare_code:
-                    # 修正 tushare 初始化：使用 TOKEN 变量而非硬编码
+                    # 修正 tushare 初始化：使用 TOKEN 变量
                     tushare_code = tushare_code.replace(
                         "ts.set_token('test_token')",
                         "ts.set_token(TOKEN)")
@@ -800,7 +808,7 @@ class JQToDaQmtConverter:
                         'pro = ts.pro_api()')
                     parts.append(tushare_code)
                     parts.append('')
-                    self._add_change('注入 tushare 数据函数（使用 TOKEN 配置）')
+                    self._add_change('注入 tushare 数据函数（ts.set_token(TOKEN)）')
             except Exception:
                 pass
 
