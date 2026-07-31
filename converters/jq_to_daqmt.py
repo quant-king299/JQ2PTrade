@@ -600,9 +600,11 @@ class JQToDaQmtConverter:
         parts.extend([
             '#encoding:gbk',
             '"""',
-            '聚宽策略 → 大QMT 自动转换 (V1.0)',
+            f'聚宽策略 → 大QMT 自动转换 (V1.0) — 回测实盘一体版',
             '"""',
             '',
+            'import os',
+            'import json',
             'import numpy as np',
             'import pandas as pd',
             'from datetime import datetime, time, timedelta',
@@ -612,24 +614,33 @@ class JQToDaQmtConverter:
             '# ========================================',
             f"ACCOUNT_ID = '{self.account_id}'",
             "ACCOUNT_TYPE = 'STOCK'",
+            "ACCOUNT_MODE = 'MONEY'      # MONEY=固定金额, RATIO=按账户比例",
+            "ACCOUNT_MONEY = 50000       # ACCOUNT_MODE为MONEY时有效",
+            "ACCOUNT_RATIO = 0.3         # ACCOUNT_MODE为RATIO时有效",
+            "STRATEGY_TRADETIME = '09:45:00'  # 实盘交易时间 HH:MM:SS",
+            "STRATEGY_PATH = r'D:\\量化策略'  # 策略文件存储路径",
             "STRATEGY_NAME = 'JQ转大QMT策略'",
+            "TOKEN = '请填入自己Tushare的token'  # 使用tushare数据函数时必填",
             '',
             '# ========================================',
             '# passorder 下单常量（勿修改）',
             '# ========================================',
-            'OPTYPE_BUY = 23          # 买入',
-            'OPTYPE_SELL = 24         # 卖出',
-            'ORDER_TYPE_VOLUME = 1101  # 按股数下单',
-            'ORDER_TYPE_MONEY = 1102   # 按金额下单',
-            'PRTYPE_FIXED = 11         # 指定价',
-            'PRTYPE_OPPOSITEBEST = 14  # 对手价',
+            'OPTYPE_BUY = 23',
+            'OPTYPE_SELL = 24',
+            'ORDER_TYPE_VOLUME = 1101',
+            'ORDER_TYPE_MONEY = 1102',
+            'PRTYPE_FIXED = 11',
+            'PRTYPE_OPPOSITEBEST = 14',
             '',
             '# ========================================',
-            '# 全局变量（从聚宽 g.xxx 转换）',
+            '# 全局变量',
             '# ========================================',
             'class GlobalVariable:',
             '    pass',
             'gvar = GlobalVariable()',
+            'gvar.is_backtest = True    # init()中根据ContextInfo.do_back_test自动设置',
+            'gvar.quick_trade = 0       # 回测=0, 实盘=1',
+            'gvar.stg_start_dt = datetime.now()',
         ])
 
         if global_vars:
@@ -764,32 +775,46 @@ class JQToDaQmtConverter:
         parts.append('def init(ContextInfo):')
         parts.append('    """策略初始化"""')
         parts.append('    ContextInfo.set_account(ACCOUNT_ID)')
-        parts.append(f"    print('聚宽→大QMT 转换策略启动: {{STRATEGY_NAME}}')")
+        parts.append('')
+        parts.append('    # 判断回测/实盘模式')
+        parts.append('    gvar.is_backtest = ContextInfo.do_back_test')
+        parts.append('    gvar.quick_trade = 0 if gvar.is_backtest else 1')
+        parts.append(f"    print(f'{{STRATEGY_NAME}}: {{\"回测\" if gvar.is_backtest else \"实盘\"}}模式')")
+        parts.append('')
+        parts.append('    if gvar.is_backtest:')
+        parts.append('        print(\'回测模式 — 通过 handlebar K线驱动\')')
+        parts.append('    else:')
+        parts.append('        print(\'实盘模式 — 通过 run_time 定时任务驱动\')')
 
-        # 生成 run_time 调用
+        # 生成 run_time 调用（实盘模式）
         if analysis['timing_functions']:
             parts.append('')
-            parts.append('    # ===== 定时任务（从聚宽 run_daily/run_weekly/run_monthly 转换）=====')
+            parts.append('        # ===== 实盘定时任务 =====')
+            # Trade time
             for ttype, fname, params in analysis['timing_functions']:
                 if ttype == 'run_daily':
                     time_str = self._parse_run_daily_time(params)
-                    parts.append(f"    # 原: run_daily({fname}, {params})")
-                    parts.append(f"    ContextInfo.run_time('{fname}', '1nDay', '2020-01-01 {time_str}')")
+                    parts.append(f"        # 原: {ttype}({fname}, {params})")
+                    parts.append(f"        _run_time = gvar.stg_start_dt.strftime('%Y-%m-%d') + ' ' + STRATEGY_TRADETIME")
+                    parts.append(f"        ContextInfo.run_time('{fname}', '1nDay',"
+                                 f" gvar.stg_start_dt.strftime('%Y-%m-%d') + ' {time_str}')")
                 elif ttype == 'run_weekly':
-                    wday, time_str = self._parse_run_weekly_params(params)
-                    parts.append(f"    # 原: run_weekly({fname}, {params})")
-                    parts.append(f"    # 注: 大QMT run_time 不直接支持指定星期，此处用每日+函数内判断星期")
-                    parts.append(f"    ContextInfo.run_time('{fname}', '1nDay', '2020-01-01 {time_str}')")
+                    parts.append(f"        # 原: {ttype}({fname}, {params})")
+                    parts.append(f"        # 注: 大QMT 不直接支持指定星期，在 {fname} 内判断 weekday")
+                    parts.append(f"        ContextInfo.run_time('{fname}', '1nDay',"
+                                 f" gvar.stg_start_dt.strftime('%Y-%m-%d') + ' 09:30:00')")
                 elif ttype == 'run_monthly':
-                    parts.append(f"    # 原: run_monthly({fname}, {params})")
-                    parts.append(f"    # 注: 大QMT run_time 不直接支持每月执行，请在 {fname} 内判断日期")
-                    parts.append(f"    ContextInfo.run_time('{fname}', '1nDay', '2020-01-01 09:30:00')")
-            self._add_change(f'添加 run_time 定时任务 ({len(analysis["timing_functions"])}个)')
+                    parts.append(f"        # 原: {ttype}({fname}, {params})")
+                    parts.append(f"        ContextInfo.run_time('{fname}', '1nDay',"
+                                 f" gvar.stg_start_dt.strftime('%Y-%m-%d') + ' 09:30:00')")
+            self._add_change(f'添加实盘 run_time 定时任务 ({len(analysis["timing_functions"])}个)')
 
         parts.append('')
         parts.append('')
         parts.append('def handlebar(ContextInfo):')
-        parts.append('    """K线驱动回调"""')
+        parts.append('    """K线驱动回调（仅回测模式执行）"""')
+        parts.append('    if not gvar.is_backtest:')
+        parts.append('        return')
         parts.append('    today = timetag_to_datetime('
                       "ContextInfo.get_bar_timetag(ContextInfo.barpos), '%Y%m%d')")
         parts.append(f"    print(f'---{{today}}---')")
@@ -800,13 +825,19 @@ class JQToDaQmtConverter:
 
         parts.append('')
 
-        # ---- 回测专用 ----
+        # ---- 回测实盘一体说明 ----
+        parts.append('# ========================================')
+        parts.append('# 回测实盘一体说明')
+        parts.append('# ========================================')
+        parts.append('# 回测模式: handlebar() 按K线周期驱动策略逻辑')
+        parts.append('# 实盘模式: init() 中的 ContextInfo.run_time() 定时任务驱动')
+        parts.append('# 切换方式: 由 ContextInfo.do_back_test 自动判断')
+        parts.append('# 回测模式 quick_trade=0，实盘模式 quick_trade=1')
         if analysis['timing_functions']:
-            parts.append('# ========================================')
-            parts.append('# 注：以上 run_time 定时任务在回测时可能不触发')
-            parts.append('# 回测时策略按 handlebar 逐K线执行')
-            parts.append('# ========================================')
-            parts.append('')
+            parts.append('# 实盘定时任务已在 init() 中注册:')
+            for ttype, fname, params in analysis['timing_functions']:
+                parts.append(f'#   {ttype}({fname}, {params})')
+        parts.append('')
 
         # ---- 转换报告注释 ----
         parts.append('# ========================================')
