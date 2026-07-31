@@ -17,8 +17,18 @@
 
 import re
 import textwrap
+import os
 from typing import Dict, List, Optional
 from datetime import datetime
+
+# 尝试导入 tushare 注入模块（从同目录加载）
+try:
+    from .tushare_data_functions import get_injection_code as _get_tushare_injection
+except ImportError:
+    try:
+        from tushare_data_functions import get_injection_code as _get_tushare_injection
+    except ImportError:
+        _get_tushare_injection = None
 
 
 class JQToDaQmtConverter:
@@ -47,7 +57,7 @@ class JQToDaQmtConverter:
             'get_security_info': '_get_security_info',
             'get_current_data': '_get_current_data_compat',
             'get_index_stocks': 'ContextInfo.get_stock_list_in_sector',
-            'get_fundamentals': 'ContextInfo.get_financial_data',
+            'get_fundamentals': '_get_fundamentals_continuously',  # tushare 替代
         }
 
         # log 映射
@@ -163,6 +173,7 @@ class JQToDaQmtConverter:
             'uses_index_stocks': False,
             'timing_functions': [],
             'strategy_name': 'JQ转大QMT策略',
+            'tushare_functions': [],  # 需要注入的 tushare 函数列表
         }
 
         if re.search(r'\b(order|order_value|order_target|order_target_value|order_target_percent)\s*\(', code):
@@ -170,12 +181,30 @@ class JQToDaQmtConverter:
 
         if re.search(r'\bget_current_data\s*\(', code):
             analysis['uses_get_current_data'] = True
+            analysis['tushare_functions'].append('get_current_data')
 
-        if re.search(r'\bget_fundamentals\s*\(|\bquery\s*\(', code):
+        if re.search(r'\bget_fundamentals\s*\(', code):
             analysis['uses_fundamentals'] = True
+            analysis['tushare_functions'].append('get_fundamentals_continuously')
+
+        if re.search(r'\bget_factor_values\s*\(', code):
+            analysis['uses_get_factor_values'] = True
+            analysis['tushare_functions'].append('get_factor_values')
 
         if re.search(r'\bget_index_stocks\s*\(', code):
             analysis['uses_index_stocks'] = True
+
+        if re.search(r'\bget_all_securities\s*\(', code):
+            analysis['tushare_functions'].append('get_all_securities')
+
+        if re.search(r'\bget_extras\s*\(', code):
+            analysis['tushare_functions'].append('get_extras')
+
+        if re.search(r'\bget_industry\s*\(', code):
+            analysis['tushare_functions'].append('get_industry')
+
+        # 去重
+        analysis['tushare_functions'] = list(set(analysis['tushare_functions']))
 
         # 提取 timing_functions
         timing_patterns = [
@@ -694,6 +723,18 @@ class JQToDaQmtConverter:
                 '    return ContextInfo.get_instrument_detail(code)',
                 '',
             ])
+
+        # ---- Tushare 数据函数注入 ----
+        tushare_funcs = analysis.get('tushare_functions', [])
+        if tushare_funcs and _get_tushare_injection:
+            try:
+                tushare_code = _get_tushare_injection(tushare_funcs, tushare_token='')
+                if tushare_code:
+                    parts.append(tushare_code)
+                    parts.append('')
+                    self._add_function('tushare 数据函数注入')
+            except Exception:
+                pass
 
         # ---- 策略函数 ----
         parts.append('# ========================================')
