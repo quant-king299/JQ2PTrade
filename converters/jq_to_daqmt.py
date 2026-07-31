@@ -617,6 +617,7 @@ class JQToDaQmtConverter:
             "ACCOUNT_MODE = 'MONEY'      # MONEY=固定金额, RATIO=按账户比例",
             "ACCOUNT_MONEY = 50000       # ACCOUNT_MODE为MONEY时有效",
             "ACCOUNT_RATIO = 0.3         # ACCOUNT_MODE为RATIO时有效",
+            "ORDER_TIMEOUT = 60             # 订单超时秒数",
             "STRATEGY_TRADETIME = '09:45:00'  # 实盘交易时间 HH:MM:SS",
             "STRATEGY_PATH = r'D:\\量化策略'  # 策略文件存储路径",
             "STRATEGY_NAME = 'JQ转大QMT策略'",
@@ -638,9 +639,14 @@ class JQToDaQmtConverter:
             'class GlobalVariable:',
             '    pass',
             'gvar = GlobalVariable()',
-            'gvar.is_backtest = True    # init()中根据ContextInfo.do_back_test自动设置',
+            'gvar.is_backtest = True    # init()中自动设置',
             'gvar.quick_trade = 0       # 回测=0, 实盘=1',
             'gvar.stg_start_dt = datetime.now()',
+            'gvar.strategy_position = {{}}  # 策略持仓 {{code: {"volume": int}}}',
+            'gvar.canceling_order_id_list = []  # 待撤单ID列表',
+            'gvar.strategy_folder = None',
+            'gvar.position_file = None',
+            'gvar.tradelog_file = None',
         ])
 
         if global_vars:
@@ -654,10 +660,14 @@ class JQToDaQmtConverter:
         parts.append('# 辅助函数')
         parts.append('# ========================================')
         parts.append('')
-
-        # timetag_to_datetime（大QMT 内置，但显式声明）
         parts.append('# 注: timetag_to_datetime 是大QMT内置函数，无需定义')
         parts.append('')
+
+        # ---- V2 实盘基础设施（交易策略必需）----
+        if analysis.get('has_trading'):
+            parts.append('')
+            parts.extend(self._gen_v2_infrastructure())
+            parts.append('')
 
         # _get_position_amount 辅助
         if analysis.get('has_trading'):
@@ -781,15 +791,43 @@ class JQToDaQmtConverter:
         parts.append('    gvar.quick_trade = 0 if gvar.is_backtest else 1')
         parts.append(f"    print(f'{{STRATEGY_NAME}}: {{\"回测\" if gvar.is_backtest else \"实盘\"}}模式')")
         parts.append('')
+        # V2 实盘基础设施初始化
+        if analysis.get('has_trading'):
+            parts.append('')
+            parts.append('    # 初始化策略文件（仅实盘）')
+            parts.append('    init_strategy_files()')
+            parts.append('    load_strategy_position()')
+            parts.append('    verify_and_update_position()')
+            parts.append('    handle_history_orders(ContextInfo)')
+
         parts.append('    if gvar.is_backtest:')
         parts.append('        print(\'回测模式 — 通过 handlebar K线驱动\')')
         parts.append('    else:')
         parts.append('        print(\'实盘模式 — 通过 run_time 定时任务驱动\')')
 
-        # 生成 run_time 调用（实盘模式）
-        if analysis['timing_functions']:
+        # 生成 run_time 调用（实盘模式）+ V2 订单管理
+        if analysis['timing_functions'] or analysis.get('has_trading'):
             parts.append('')
             parts.append('        # ===== 实盘定时任务 =====')
+            parts.append('')
+            parts.append('        # 交易时间计算')
+            parts.append('        from datetime import datetime, timedelta')
+            parts.append('        if datetime.now().strftime("%H:%M:%S") <= STRATEGY_TRADETIME:')
+            parts.append('            stg_run_time = gvar.stg_start_dt.strftime("%Y-%m-%d") + " " + STRATEGY_TRADETIME')
+            parts.append('        elif datetime.now().strftime("%H:%M:%S") < "15:00:00":')
+            parts.append('            stg_run_time = (datetime.now() + timedelta(seconds=3)).strftime("%Y-%m-%d %H:%M:%S")')
+            parts.append('        else:')
+            parts.append('            stg_run_time = (gvar.stg_start_dt + timedelta(days=1)).strftime("%Y-%m-%d") + " " + STRATEGY_TRADETIME')
+            parts.append('')
+
+            # V2 order management timers
+            if analysis.get('has_trading'):
+                parts.append('        # 订单超时检查（每10秒）')
+                parts.append("        ContextInfo.run_time('handle_pending_orders', '10nSecond', stg_run_time)")
+                parts.append('        # 撤单重下（每2秒）')
+                parts.append("        ContextInfo.run_time('handle_canceling_orders', '2nSecond', stg_run_time)")
+                parts.append('')
+
             # Trade time
             for ttype, fname, params in analysis['timing_functions']:
                 if ttype == 'run_daily':
@@ -896,6 +934,212 @@ class JQToDaQmtConverter:
                     time_str = tm.group(1) + ':00'
 
         return weekday, time_str
+
+    # ================================================================
+    #  V2 实盘基础设施模板（参考大QMT代码/小市值基础策略V2）
+    # ================================================================
+
+    def _gen_v2_infrastructure(self) -> List[str]:
+        """生成回测实盘一体所需的完整基础设施"""
+        return [
+            '# ========================================',
+            '# V2 实盘基础设施（回测实盘一体）',
+            '# ========================================',
+            '',
+            '# ===== 委托状态枚举 =====',
+            'ORDER_STATUS = {',
+            "    'WAIT_REPORTING': 49, 'REPORTED': 50,",
+            "    'REPORTED_CANCEL': 51, 'PARTSUCC_CANCEL': 52,",
+            "    'PART_CANCELED': 53, 'CANCELED': 54,",
+            "    'PART_SUCC': 55, 'SUCCEEDED': 56, 'JUNK': 57",
+            '}',
+            '',
+            '# ===== 委托方向枚举 =====',
+            'ORDER_DIRECTION = {',
+            "    'BUY': 48, 'SELL': 49",
+            '}',
+            '',
+            'def log_info(message):',
+            '    """日志输出（回测: print, 实盘: print + 写文件）"""',
+            '    print(message)',
+            '    if (not gvar.is_backtest) and hasattr(gvar, "tradelog_file") and gvar.tradelog_file:',
+            '        try:',
+            '            from datetime import datetime',
+            '            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")',
+            '            with open(gvar.tradelog_file, "a", encoding="utf-8") as f:',
+            '                f.write(f"[{{timestamp}}] {{message}}\\n")',
+            '        except Exception as e:',
+            '            print(f"写入日志失败: {{e}}")',
+            '',
+            'def is_trading_time():',
+            '    """判断当前是否在交易时段"""',
+            '    from datetime import datetime, time',
+            '    now = datetime.now().time()',
+            '    return (time(9, 30) <= now < time(11, 30)) or (time(13, 0) <= now < time(15, 0))',
+            '',
+            'def init_strategy_files():',
+            '    """初始化策略文件夹和文件路径（仅实盘）"""',
+            '    if gvar.is_backtest:',
+            '        return',
+            '    import os',
+            '    gvar.strategy_folder = os.path.join(STRATEGY_PATH, STRATEGY_NAME)',
+            '    if not os.path.exists(gvar.strategy_folder):',
+            '        os.makedirs(gvar.strategy_folder)',
+            '    gvar.position_file = os.path.join(gvar.strategy_folder, "position.json")',
+            '    gvar.tradelog_file = os.path.join(gvar.strategy_folder, "tradelog.txt")',
+            '',
+            'def load_strategy_position():',
+            '    """从文件加载策略持仓（仅实盘）"""',
+            '    if gvar.is_backtest:',
+            '        gvar.strategy_position = {{}}',
+            '        return',
+            '    import json, os',
+            '    if os.path.exists(gvar.position_file):',
+            '        try:',
+            '            with open(gvar.position_file, "r", encoding="utf-8") as f:',
+            '                gvar.strategy_position = json.load(f)',
+            '            log_info(f"加载策略持仓成功: {{gvar.strategy_position}}")',
+            '        except Exception as e:',
+            '            log_info(f"加载策略持仓失败: {{e}}")',
+            '            gvar.strategy_position = {{}}',
+            '    else:',
+            '        log_info("策略持仓文件不存在，初始化持仓为空")',
+            '        gvar.strategy_position = {{}}',
+            '',
+            'def save_strategy_position():',
+            '    """保存策略持仓到文件（仅实盘）"""',
+            '    if gvar.is_backtest:',
+            '        return',
+            '    import json',
+            '    try:',
+            '        with open(gvar.position_file, "w", encoding="utf-8") as f:',
+            '            json.dump(gvar.strategy_position, f)',
+            '    except Exception as e:',
+            '        log_info(f"保存策略持仓失败: {{e}}")',
+            '',
+            'def update_strategy_position(code, direction, volume):',
+            '    """更新策略持仓（仅实盘）"""',
+            '    if gvar.is_backtest:',
+            '        return',
+            '    if code not in gvar.strategy_position:',
+            '        gvar.strategy_position[code] = {{"volume": 0}}',
+            '    old = gvar.strategy_position[code]["volume"]',
+            '    if direction.upper() == "BUY":',
+            '        gvar.strategy_position[code]["volume"] += volume',
+            '    else:',
+            '        gvar.strategy_position[code]["volume"] -= volume',
+            '    new = gvar.strategy_position[code]["volume"]',
+            '    if new <= 0:',
+            '        del gvar.strategy_position[code]',
+            '    save_strategy_position()',
+            '',
+            'def verify_and_update_position():',
+            '    """校验策略持仓与实际账户持仓一致性（仅实盘）"""',
+            '    if gvar.is_backtest:',
+            '        return',
+            '    log_info("校验策略持仓与实际账户持仓...")',
+            '    pos_list = get_trade_detail_data(ACCOUNT_ID, ACCOUNT_TYPE, "POSITION")',
+            '    actual = {{p.m_strInstrumentID + "." + p.m_strExchangeID: p.m_nVolume for p in pos_list}}',
+            '    for code in list(gvar.strategy_position.keys()):',
+            '        if code not in actual:',
+            '            del gvar.strategy_position[code]',
+            '            log_info(f"实际账户无 {{code}}，从策略持仓删除")',
+            '        elif gvar.strategy_position[code]["volume"] > actual[code]:',
+            '            gvar.strategy_position[code]["volume"] = actual[code]',
+            '            log_info(f"{{code}} 策略持仓超实际，以实际为准")',
+            '    save_strategy_position()',
+            '',
+            'def handle_history_orders(ContextInfo):',
+            '    """处理策略重启前的历史委托（仅实盘）"""',
+            '    if gvar.is_backtest:',
+            '        return',
+            '    log_info("检查历史订单...")',
+            '    from datetime import datetime',
+            '    orders = get_trade_detail_data(ACCOUNT_ID, ACCOUNT_TYPE, "ORDER", STRATEGY_NAME)',
+            '    if not orders:',
+            '        return',
+            '    stg_time = gvar.stg_start_dt.strftime("%Y%m%d%H%M%S")',
+            '    for o in orders:',
+            '        if o.m_strInsertDate + o.m_strInsertTime >= stg_time:',
+            '            continue',
+            '        if o.m_nOrderStatus in [ORDER_STATUS["WAIT_REPORTING"], ORDER_STATUS["REPORTED"], ORDER_STATUS["PART_SUCC"]]:',
+            '            code = o.m_strInstrumentID + "." + o.m_strExchangeID',
+            '            cancel(o.m_strOrderSysID, ACCOUNT_ID, ACCOUNT_TYPE, ContextInfo)',
+            '            log_info(f"撤销历史订单: {{code}}")',
+            '    log_info("历史订单检查完成")',
+            '',
+            'def handle_pending_orders(ContextInfo):',
+            '    """超时未成交委托撤单（仅实盘，每10秒检查）"""',
+            '    if gvar.is_backtest or not is_trading_time():',
+            '        return',
+            '    from datetime import datetime',
+            '    orders = get_trade_detail_data(ACCOUNT_ID, ACCOUNT_TYPE, "ORDER", STRATEGY_NAME)',
+            '    if not orders:',
+            '        return',
+            '    stg_time = gvar.stg_start_dt.strftime("%Y%m%d%H%M%S")',
+            '    now = datetime.now().strftime("%H%M%S")',
+            '    for o in orders:',
+            '        if o.m_strInsertDate + o.m_strInsertTime < stg_time:',
+            '            continue',
+            '        if o.m_strOrderSysID in gvar.canceling_order_id_list:',
+            '            continue',
+            '        if o.m_nOrderStatus in [ORDER_STATUS["WAIT_REPORTING"], ORDER_STATUS["REPORTED"], ORDER_STATUS["PART_SUCC"]]:',
+            '            interval = datetime.strptime(now, "%H%M%S") - datetime.strptime(o.m_strInsertTime, "%H%M%S")',
+            '            if interval.total_seconds() > ORDER_TIMEOUT:',
+            '                gvar.canceling_order_id_list.append(o.m_strOrderSysID)',
+            '                cancel(o.m_strOrderSysID, ACCOUNT_ID, ACCOUNT_TYPE, ContextInfo)',
+            '                log_info(f"超时撤单: {{o.m_strInstrumentID}}.{{o.m_strExchangeID}} ({{interval.total_seconds():.0f}}s)")',
+            '',
+            'def handle_canceling_orders(ContextInfo):',
+            '    """处理已撤单委托的重新下单（仅实盘，每2秒检查）"""',
+            '    if gvar.is_backtest or not gvar.canceling_order_id_list:',
+            '        return',
+            '    if not is_trading_time():',
+            '        return',
+            '    from datetime import datetime',
+            '    orders = get_trade_detail_data(ACCOUNT_ID, ACCOUNT_TYPE, "ORDER", STRATEGY_NAME)',
+            '    if not orders:',
+            '        return',
+            '    canceling = gvar.canceling_order_id_list[:]',
+            '    for o in orders:',
+            '        if o.m_strOrderSysID not in canceling:',
+            '            continue',
+            '        if o.m_nOrderStatus not in [ORDER_STATUS["PART_CANCELED"], ORDER_STATUS["CANCELED"]]:',
+            '            continue',
+            '        gvar.canceling_order_id_list.remove(o.m_strOrderSysID)',
+            '        code = o.m_strInstrumentID + "." + o.m_strExchangeID',
+            '        rem = o.m_nVolumeTotalOriginal - o.m_nVolumeTraded',
+            '        if o.m_nOffsetFlag == ORDER_DIRECTION["BUY"]:',
+            '            rem = int(rem / 100) * 100',
+            '        else:',
+            '            rem = -int(rem / 100) * 100',
+            '        if rem >= 100:',
+            '            uoi = STRATEGY_NAME + "_" + datetime.now().strftime("%Y%m%d%H%M%S")',
+            '            passorder(OPTYPE_BUY, ORDER_TYPE_VOLUME, ACCOUNT_ID, code, PRTYPE_OPPOSITEBEST, -1, rem, STRATEGY_NAME, gvar.quick_trade, uoi, ContextInfo)',
+            '            log_info(f"撤单重买: {{code}} x{{rem}}")',
+            '        elif rem <= -100:',
+            '            uoi = STRATEGY_NAME + "_" + datetime.now().strftime("%Y%m%d%H%M%S")',
+            '            passorder(OPTYPE_SELL, ORDER_TYPE_VOLUME, ACCOUNT_ID, code, PRTYPE_OPPOSITEBEST, -1, abs(rem), STRATEGY_NAME, gvar.quick_trade, uoi, ContextInfo)',
+            '            log_info(f"撤单重卖: {{code}} x{{abs(rem)}}")',
+            '',
+            'def deal_callback(ContextInfo, dealInfo):',
+            '    """成交回报回调（仅实盘，由系统自动调用）"""',
+            '    if gvar.is_backtest:',
+            '        return',
+            '    if dealInfo.m_strRemark.strip().split("_")[0] != STRATEGY_NAME:',
+            '        return',
+            '    from datetime import datetime',
+            '    stg_time = gvar.stg_start_dt.strftime("%Y%m%d%H%M%S")',
+            '    if dealInfo.m_strTradeDate + dealInfo.m_strTradeTime < stg_time:',
+            '        return',
+            '    try:',
+            '        code = dealInfo.m_strInstrumentID + "." + dealInfo.m_strExchangeID',
+            '        direction = "BUY" if dealInfo.m_nOffsetFlag == ORDER_DIRECTION["BUY"] else "SELL"',
+            '        update_strategy_position(code, direction, dealInfo.m_nVolume)',
+            '    except Exception as e:',
+            '        log_info(f"deal_callback异常: {{e}}")',
+            '',
+        ]
 
     # ================================================================
     #  报告相关
