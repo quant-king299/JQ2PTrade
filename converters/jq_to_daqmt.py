@@ -104,21 +104,50 @@ class JQToDaQmtConverter:
         # Step 3: 提取函数体和全局变量
         extracted = self._extract_code_blocks(code)
 
-        # 从 initialize() 提取 g.xxx 全局变量
+        # 从 initialize() 提取 g.xxx 全局变量（支持多行列表/字典赋值）
         if 'initialize' in extracted['functions']:
-            init_body = extracted['functions']['initialize']['body']
-            for line in init_body.split('\n'):
+            init_lines = extracted['functions']['initialize']['body'].split('\n')
+            i = 0
+            while i < len(init_lines):
+                line = init_lines[i]
                 g_match = re.match(r'\s*g\.(\w+)\s*=\s*(.+)', line)
                 if g_match:
                     var_name = g_match.group(1)
                     var_value = g_match.group(2).strip()
+                    # 检测多行赋值：以 [ 或 ( 或 { 开头但未在同一行闭合
+                    if var_value.endswith('[') or var_value.endswith('(') or var_value.endswith('{'):
+                        bracket = var_value[-1]
+                        close_bracket = {']': ']', '(': ')', '{': '}'}[bracket]
+                        # 收集后续行直到括号闭合
+                        j = i + 1
+                        while j < len(init_lines):
+                            cont_line = init_lines[j].strip()
+                            var_value += '\n' + init_lines[j].rstrip()
+                            if cont_line.startswith(close_bracket) or cont_line == close_bracket:
+                                break
+                            if close_bracket in cont_line:
+                                break
+                            j += 1
+                        i = j  # 跳到闭合行
+                    full_line = f'gvar.{var_name} = {var_value}'
                     if not any(v.startswith(f'gvar.{var_name} =') for v in extracted['global_vars']):
-                        extracted['global_vars'].append(self._standardize_codes(f'gvar.{var_name} = {var_value}'))
+                        extracted['global_vars'].append(self._standardize_codes(full_line))
                         self._add_mapping(f'g.{var_name} → gvar.{var_name}')
+                i += 1
             del extracted['functions']['initialize']
 
-        # 对全局变量也做代码标准化
-        extracted['global_vars'] = [self._standardize_codes(v) for v in extracted['global_vars']]
+        # 对全局变量做代码标准化，同时过滤掉孤立的多行续行
+        standardized = []
+        for v in extracted['global_vars']:
+            v = self._standardize_codes(v)
+            stripped = v.strip()
+            # 过滤掉纯续行（以引号或逗号开头的孤立行）
+            if stripped.startswith("'") or stripped.startswith('"') or stripped.startswith(',') or stripped.startswith(']') or stripped.startswith(')'):
+                continue
+            if stripped == '' or stripped.startswith('#'):
+                continue
+            standardized.append(v)
+        extracted['global_vars'] = standardized
 
         # Step 4: 对每个函数体应用转换管道
         all_func_names = set(extracted['functions'].keys())
@@ -294,7 +323,18 @@ class JQToDaQmtConverter:
                 }
                 continue
             else:
-                global_lines.append(line)
+                stripped = line.strip()
+                # 过滤掉多行赋值的续行（以引号/逗号/方括号开头的缩进行）
+                if stripped.startswith("'") or stripped.startswith('"'):
+                    pass  # skip continuation
+                elif stripped.startswith(',') or stripped.startswith(']') or stripped.startswith(')'):
+                    pass  # skip continuation
+                elif stripped.startswith('#') or stripped == '':
+                    global_lines.append(line)  # keep comments and blanks
+                elif stripped.startswith('import ') or stripped.startswith('from '):
+                    global_lines.append(line)
+                else:
+                    global_lines.append(line)
             i += 1
 
         return result
@@ -642,7 +682,7 @@ class JQToDaQmtConverter:
             'gvar.is_backtest = True    # init()中自动设置',
             'gvar.quick_trade = 0       # 回测=0, 实盘=1',
             'gvar.stg_start_dt = datetime.now()',
-            'gvar.strategy_position = {{}}  # 策略持仓 {{code: {"volume": int}}}',
+            'gvar.strategy_position = {}  # 策略持仓 {code: {"volume": int}}',
             'gvar.canceling_order_id_list = []  # 待撤单ID列表',
             'gvar.strategy_folder = None',
             'gvar.position_file = None',
@@ -974,9 +1014,9 @@ class JQToDaQmtConverter:
             '            from datetime import datetime',
             '            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")',
             '            with open(gvar.tradelog_file, "a", encoding="utf-8") as f:',
-            '                f.write(f"[{{timestamp}}] {{message}}\\n")',
+            '                f.write(f"[{timestamp}] {message}\\n")',
             '        except Exception as e:',
-            '            print(f"写入日志失败: {{e}}")',
+            '            print(f"写入日志失败: {e}")',
             '',
             'def is_trading_time():',
             '    """判断当前是否在交易时段"""',
@@ -998,20 +1038,20 @@ class JQToDaQmtConverter:
             'def load_strategy_position():',
             '    """从文件加载策略持仓（仅实盘）"""',
             '    if gvar.is_backtest:',
-            '        gvar.strategy_position = {{}}',
+            '        gvar.strategy_position = {}',
             '        return',
             '    import json, os',
             '    if os.path.exists(gvar.position_file):',
             '        try:',
             '            with open(gvar.position_file, "r", encoding="utf-8") as f:',
             '                gvar.strategy_position = json.load(f)',
-            '            log_info(f"加载策略持仓成功: {{gvar.strategy_position}}")',
+            '            log_info(f"加载策略持仓成功: {gvar.strategy_position}")',
             '        except Exception as e:',
-            '            log_info(f"加载策略持仓失败: {{e}}")',
-            '            gvar.strategy_position = {{}}',
+            '            log_info(f"加载策略持仓失败: {e}")',
+            '            gvar.strategy_position = {}',
             '    else:',
             '        log_info("策略持仓文件不存在，初始化持仓为空")',
-            '        gvar.strategy_position = {{}}',
+            '        gvar.strategy_position = {}',
             '',
             'def save_strategy_position():',
             '    """保存策略持仓到文件（仅实盘）"""',
@@ -1022,14 +1062,14 @@ class JQToDaQmtConverter:
             '        with open(gvar.position_file, "w", encoding="utf-8") as f:',
             '            json.dump(gvar.strategy_position, f)',
             '    except Exception as e:',
-            '        log_info(f"保存策略持仓失败: {{e}}")',
+            '        log_info(f"保存策略持仓失败: {e}")',
             '',
             'def update_strategy_position(code, direction, volume):',
             '    """更新策略持仓（仅实盘）"""',
             '    if gvar.is_backtest:',
             '        return',
             '    if code not in gvar.strategy_position:',
-            '        gvar.strategy_position[code] = {{"volume": 0}}',
+            '        gvar.strategy_position[code] = {"volume": 0}',
             '    old = gvar.strategy_position[code]["volume"]',
             '    if direction.upper() == "BUY":',
             '        gvar.strategy_position[code]["volume"] += volume',
@@ -1046,14 +1086,14 @@ class JQToDaQmtConverter:
             '        return',
             '    log_info("校验策略持仓与实际账户持仓...")',
             '    pos_list = get_trade_detail_data(ACCOUNT_ID, ACCOUNT_TYPE, "POSITION")',
-            '    actual = {{p.m_strInstrumentID + "." + p.m_strExchangeID: p.m_nVolume for p in pos_list}}',
+            '    actual = {p.m_strInstrumentID + "." + p.m_strExchangeID: p.m_nVolume for p in pos_list}',
             '    for code in list(gvar.strategy_position.keys()):',
             '        if code not in actual:',
             '            del gvar.strategy_position[code]',
-            '            log_info(f"实际账户无 {{code}}，从策略持仓删除")',
+            '            log_info(f"实际账户无 {code}，从策略持仓删除")',
             '        elif gvar.strategy_position[code]["volume"] > actual[code]:',
             '            gvar.strategy_position[code]["volume"] = actual[code]',
-            '            log_info(f"{{code}} 策略持仓超实际，以实际为准")',
+            '            log_info(f"{code} 策略持仓超实际，以实际为准")',
             '    save_strategy_position()',
             '',
             'def handle_history_orders(ContextInfo):',
@@ -1072,7 +1112,7 @@ class JQToDaQmtConverter:
             '        if o.m_nOrderStatus in [ORDER_STATUS["WAIT_REPORTING"], ORDER_STATUS["REPORTED"], ORDER_STATUS["PART_SUCC"]]:',
             '            code = o.m_strInstrumentID + "." + o.m_strExchangeID',
             '            cancel(o.m_strOrderSysID, ACCOUNT_ID, ACCOUNT_TYPE, ContextInfo)',
-            '            log_info(f"撤销历史订单: {{code}}")',
+            '            log_info(f"撤销历史订单: {code}")',
             '    log_info("历史订单检查完成")',
             '',
             'def handle_pending_orders(ContextInfo):',
@@ -1095,7 +1135,7 @@ class JQToDaQmtConverter:
             '            if interval.total_seconds() > ORDER_TIMEOUT:',
             '                gvar.canceling_order_id_list.append(o.m_strOrderSysID)',
             '                cancel(o.m_strOrderSysID, ACCOUNT_ID, ACCOUNT_TYPE, ContextInfo)',
-            '                log_info(f"超时撤单: {{o.m_strInstrumentID}}.{{o.m_strExchangeID}} ({{interval.total_seconds():.0f}}s)")',
+            '                log_info(f"超时撤单: {o.m_strInstrumentID}.{o.m_strExchangeID} ({interval.total_seconds():.0f}s)")',
             '',
             'def handle_canceling_orders(ContextInfo):',
             '    """处理已撤单委托的重新下单（仅实盘，每2秒检查）"""',
@@ -1123,11 +1163,11 @@ class JQToDaQmtConverter:
             '        if rem >= 100:',
             '            uoi = STRATEGY_NAME + "_" + datetime.now().strftime("%Y%m%d%H%M%S")',
             '            passorder(OPTYPE_BUY, ORDER_TYPE_VOLUME, ACCOUNT_ID, code, PRTYPE_OPPOSITEBEST, -1, rem, STRATEGY_NAME, gvar.quick_trade, uoi, ContextInfo)',
-            '            log_info(f"撤单重买: {{code}} x{{rem}}")',
+            '            log_info(f"撤单重买: {code} x{rem}")',
             '        elif rem <= -100:',
             '            uoi = STRATEGY_NAME + "_" + datetime.now().strftime("%Y%m%d%H%M%S")',
             '            passorder(OPTYPE_SELL, ORDER_TYPE_VOLUME, ACCOUNT_ID, code, PRTYPE_OPPOSITEBEST, -1, abs(rem), STRATEGY_NAME, gvar.quick_trade, uoi, ContextInfo)',
-            '            log_info(f"撤单重卖: {{code}} x{{abs(rem)}}")',
+            '            log_info(f"撤单重卖: {code} x{abs(rem)}")',
             '',
             'def deal_callback(ContextInfo, dealInfo):',
             '    """成交回报回调（仅实盘，由系统自动调用）"""',
@@ -1144,7 +1184,7 @@ class JQToDaQmtConverter:
             '        direction = "BUY" if dealInfo.m_nOffsetFlag == ORDER_DIRECTION["BUY"] else "SELL"',
             '        update_strategy_position(code, direction, dealInfo.m_nVolume)',
             '    except Exception as e:',
-            '        log_info(f"deal_callback异常: {{e}}")',
+            '        log_info(f"deal_callback异常: {e}")',
             '',
         ]
 
