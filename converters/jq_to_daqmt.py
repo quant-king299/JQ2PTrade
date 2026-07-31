@@ -69,7 +69,7 @@ class JQToDaQmtConverter:
         # 不支持的 API → 直接移除
         self.unsupported_apis = [
             'set_option', 'set_order_cost', 'set_commission',
-            'set_price_limit', 'enable_profile', 'log.set_level',
+            'set_slippage', 'set_price_limit', 'enable_profile', 'log.set_level',
         ]
 
         # 注释掉的 API
