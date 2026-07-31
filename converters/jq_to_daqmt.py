@@ -73,7 +73,7 @@ class JQToDaQmtConverter:
         ]
 
         # 注释掉的 API
-        self.comment_apis = ['set_benchmark', 'set_universe']
+        self.comment_apis = ['set_benchmark', 'set_universe', 'run_daily', 'run_weekly', 'run_monthly']
 
         # run_daily 时间映射
         self.time_mapping = {
