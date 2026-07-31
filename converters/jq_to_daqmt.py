@@ -12,7 +12,7 @@
 - Python 3.6+，支持 f-string
 
 作者：王者Quant
-版本：v1.0.0
+版本：v3.0.0
 """
 
 import re
@@ -600,7 +600,7 @@ class JQToDaQmtConverter:
         parts.extend([
             '#encoding:gbk',
             '"""',
-            f'聚宽策略 → 大QMT 自动转换 (V1.0) — 回测实盘一体版',
+            f'聚宽策略 → 大QMT 自动转换 (V3.0) — 回测实盘一体版',
             '"""',
             '',
             'import os',
