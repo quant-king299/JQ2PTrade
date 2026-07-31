@@ -55,6 +55,7 @@ JQ2PTrade/
 |--------|----------|------|
 | 聚宽 JoinQuant | PTrade | ✅ |
 | 聚宽 JoinQuant | EasyXT (miniQMT) | ✅ |
+| 聚宽 JoinQuant | 大QMT（内置Python） | ✅ |
 
 ## 使用说明
 
