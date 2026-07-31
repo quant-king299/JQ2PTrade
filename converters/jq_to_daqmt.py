@@ -911,9 +911,18 @@ class JQToDaQmtConverter:
         parts.append('    today = timetag_to_datetime('
                       "ContextInfo.get_bar_timetag(ContextInfo.barpos), '%Y%m%d')")
         parts.append(f"    print(f'---{{today}}---')")
+        parts.append('')
 
-        # 如果有 handle_data，调用它
-        if analysis['has_handle_data'] and 'handle_data' in functions:
+        # 回测时：按顺序调用 run_daily 注册的函数
+        if analysis['timing_functions']:
+            called = set()
+            for ttype, fname, _ in analysis['timing_functions']:
+                if fname not in called and fname in functions:
+                    parts.append(f'    {fname}(ContextInfo)')
+                    called.add(fname)
+            if called:
+                self._add_change(f'handlebar 回测调用: {list(called)}')
+        elif analysis['has_handle_data'] and 'handle_data' in functions:
             parts.append('    handle_data(ContextInfo)')
 
         parts.append('')
