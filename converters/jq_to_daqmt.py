@@ -47,10 +47,10 @@ class JQToDaQmtConverter:
 
         # API 名称映射（聚宽 → 大QMT）
         self.api_mapping = {
-            'get_price': 'ContextInfo.get_market_data_ex',
-            'get_bars': 'ContextInfo.get_market_data_ex',
-            'history': 'ContextInfo.get_market_data_ex',
-            'attribute_history': 'ContextInfo.get_market_data_ex',
+            'get_price': '_get_price',
+            'get_bars': '_get_price',
+            'history': '_get_price',
+            'attribute_history': '_get_price',
             'get_trade_days': '_get_trading_dates',
             'get_trading_dates': '_get_trading_dates',
             'get_all_securities': '_get_all_securities',
@@ -62,7 +62,7 @@ class JQToDaQmtConverter:
 
         # log 映射
         self.log_mapping = {
-            'log.info': 'log_info', 'log.warn': 'log_info',
+            'log.info': 'log_info', 'log.warn': 'log_info', 'log.warning': 'log_info',
             'log.error': 'log_info', 'log.debug': 'log_info',
         }
 
@@ -232,7 +232,7 @@ class JQToDaQmtConverter:
             (r'^[^#]*\brun_monthly\s*\(\s*(\w+)\s*,\s*([^)]+)\)', 'run_monthly'),
         ]
         for pattern, ttype in timing_patterns:
-            for m in re.finditer(pattern, code):
+            for m in re.finditer(pattern, code, re.MULTILINE):
                 analysis['timing_functions'].append(
                     (ttype, m.group(1), m.group(2).strip()))
 
@@ -350,8 +350,16 @@ class JQToDaQmtConverter:
         # _get_all_securities( → get_all_securities(
         body = body.replace('_get_all_securities(', 'get_all_securities(')
 
-        # current_dt → gvar._today_dt (回测/实盘通用当前bar时间)
+        # current_dt → gvar._today_dt (全局替换，回测/实盘通用当前bar时间)
         body = body.replace('current_dt', 'gvar._today_dt')
+        # record() → log_info() (聚宽回测记录函数)
+        body = body.replace('record(', 'log_info(')
+        # getattr(g, / hasattr(g, → gvar
+        body = body.replace('getattr(g,', 'getattr(gvar,')
+        body = body.replace('hasattr(g,', 'hasattr(gvar,')
+        # previous_date → _previous_date(ContextInfo)
+        body = body.replace('previous_date', '_previous_date(ContextInfo)')
+        # context.current_dt 也已在前面的 context_access 中处理
 
         # API 名称映射（最长优先）
         sorted_apis = sorted(self.api_mapping.items(), key=lambda x: -len(x[0]))
@@ -602,10 +610,12 @@ class JQToDaQmtConverter:
         return body
 
     def _fix_get_price_params(self, body: str) -> str:
-        """修正 get_price → ContextInfo.get_market_data_ex 参数"""
-        # get_price(codes, count=N, fields=[...])
-        # → ContextInfo.get_market_data_ex(fields=[...], stock_code=codes, period='1d', count=N)
-        # 这个转换比较复杂，简单的处理是加注释
+        """移除大QMT不支持的 get_market_data_ex 参数"""
+        import re as re2
+        body = re2.sub(r',\s*skip_paused\s*=\s*(True|False)', '', body)
+        body = re2.sub(r',\s*fq\s*=\s*.pre.', '', body)
+        body = re2.sub(r',\s*panel\s*=\s*(True|False)', '', body)
+        body = re2.sub(r',\s*fill_paused\s*=\s*(True|False)', '', body)
         return body
 
     def _fix_date_formats(self, body: str) -> str:
@@ -711,6 +721,13 @@ class JQToDaQmtConverter:
         parts.append('# 注: timetag_to_datetime 是大QMT内置函数，无需定义')
         parts.append('')
 
+        # ---- DataAPI 兼容层（聚宽风格 DataFrame）----
+        parts.append('# ========================================')
+        parts.append('# DataAPI 兼容层')
+        parts.append('# ========================================')
+        parts.extend(self._gen_data_compat())
+        parts.append('')
+
         # ---- V2 实盘基础设施（交易策略必需）----
         if analysis.get('has_trading'):
             parts.append('')
@@ -756,6 +773,19 @@ class JQToDaQmtConverter:
             '    if "000300.SH" in _df:',
             '        return list(_df["000300.SH"].index)',
             '    return []',
+            '',
+        ])
+
+        # _previous_date helper
+        parts.extend([
+            'def _previous_date(ContextInfo):',
+            '    """获取上一个交易日"""',
+            '    today = timetag_to_datetime(ContextInfo.get_bar_timetag(ContextInfo.barpos), \"%Y%m%d\")',
+            '    dl = ContextInfo.get_market_data_ex(fields=[\"close\"], stock_code=[\"000300.SH\"], period=\"1d\", end_time=today, count=3, dividend_type=\"none\")',
+            '    if \"000300.SH\" in dl:',
+            '        idx = list(dl[\"000300.SH\"].index)',
+            '        return idx[-2] if len(idx) >= 2 else today',
+            '    return today',
             '',
         ])
 
@@ -979,7 +1009,18 @@ class JQToDaQmtConverter:
         parts.append('    today = timetag_to_datetime('
                       "ContextInfo.get_bar_timetag(ContextInfo.barpos), '%Y%m%d')")
         parts.append(f"    print(f'---{{today}}---')")
+        parts.append('    gvar._ctx = ContextInfo')
         parts.append('    gvar._today_dt = datetime.strptime(today, \"%Y%m%d\")')
+        parts.append('')
+        # 回测时：按顺序调用 run_daily 注册的函数
+        if analysis['timing_functions']:
+            called = set()
+            for ttype, fname, _ in analysis['timing_functions']:
+                if fname not in called and fname in functions:
+                    parts.append(f'    {fname}(ContextInfo)')
+                    called.add(fname)
+        elif analysis['has_handle_data'] and 'handle_data' in functions:
+            parts.append('    handle_data(ContextInfo)')
         parts.append('')
 
         # 回测时：按顺序调用 run_daily 注册的函数
@@ -1067,6 +1108,102 @@ class JQToDaQmtConverter:
                     time_str = tm.group(1) + ':00'
 
         return weekday, time_str
+
+    # ================================================================
+    #  DataAPI 兼容层
+    # ================================================================
+
+    def _gen_data_compat(self) -> List[str]:
+        """生成 {code: DataFrame} → 聚宽风格 DataFrame 的兼容层"""
+        return [
+            '# ---- 聚宽数据兼容层 ----',
+            'class _PriceData:',
+            '    """聚宽多标的 DataFrame 兼容（支持 df[code]/df[field]/iloc/loc/pivot/groupby）"""',
+            '    def __init__(self, data):',
+            '        self._df = data  # pandas DataFrame with columns: time, code, field1, field2...',
+            '',
+            '    def __getitem__(self, key):',
+            '        if key in self._df.columns and key != \"code\":',
+            '            return self._df.pivot(index=\"time\", columns=\"code\", values=key)',
+            '        df = self._df[self._df[\"code\"] == key]',
+            '        if not df.empty:',
+            '            return df.set_index(\"time\").drop(columns=[\"code\"])',
+            '        return pd.DataFrame()',
+            '',
+            '    @property',
+            '    def empty(self):',
+            '        return self._df.empty',
+            '',
+            '    @property',
+            '    def iloc(self):',
+            '        return self._df.iloc',
+            '',
+            '    @property',
+            '    def loc(self):',
+            '        return self._df.loc',
+            '',
+            '    def pivot(self, **kwargs):',
+            '        return self._df.pivot(**kwargs)',
+            '',
+            '    def groupby(self, *args, **kwargs):',
+            '        return self._df.groupby(*args, **kwargs)',
+            '',
+            '    @property',
+            '    def index(self):',
+            '        return self._df.index',
+            '',
+            '    @property',
+            '    def columns(self):',
+            '        return self._df.columns',
+            '',
+            '',
+            'def _get_price(stock_code, count=None, period=\"1d\", fields=None,',
+            '               end_time=None, start_time=None, skip_paused=False):',
+            '    """聚宽 get_price/attribute_history/history 兼容',
+            '    将 大QMT {code: DataFrame} → 聚宽风格 DataFrame',
+            '    单标的返回简单 DataFrame，多标的返回 _PriceData 包装"""',
+            '    if isinstance(stock_code, str):',
+            '        stock_codes = [stock_code]',
+            '    else:',
+            '        stock_codes = list(stock_code)',
+            '    if fields is None:',
+            '        fields = [\"close\"]',
+            '    if isinstance(fields, str):',
+            '        fields = [fields]',
+            '    if end_time is None:',
+            '        end_time = \"\"',
+            '    if isinstance(end_time, datetime):',
+            '        end_time = end_time.strftime(\"%Y%m%d\")',
+            '    if count is None:',
+            '        count = -1',
+            '',
+            '    raw = gvar._ctx.get_market_data_ex(',
+            '        fields=fields, stock_code=stock_codes, period=period,',
+            '        end_time=str(end_time), count=count, dividend_type=\"front\")',
+            '',
+            '    # {code: DataFrame} → flat DataFrame',
+            '    rows = []',
+            '    for code, df_item in raw.items():',
+            '        if df_item is not None and len(df_item) > 0:',
+            '            for idx in df_item.index:',
+            '                row = {\"time\": idx, \"code\": code}',
+            '                for f in fields:',
+            '                    row[f] = df_item.loc[idx, f] if f in df_item.columns else None',
+            '                rows.append(row)',
+            '',
+            '    if not rows:',
+            '        return pd.DataFrame()',
+            '',
+            '    result = pd.DataFrame(rows)',
+            '    result[\"time\"] = pd.to_datetime(result[\"time\"].astype(str), format=\"%Y%m%d\", errors=\"coerce\")',
+            '    result = result.dropna(subset=[\"time\"])',
+            '    result = result.sort_values([\"code\", \"time\"]).reset_index(drop=True)',
+            '',
+            '    if len(stock_codes) == 1:',
+            '        return result.drop(columns=[\"code\"]).set_index(\"time\")',
+            '    return _PriceData(result)',
+            '',
+        ]
 
     # ================================================================
     #  V2 实盘基础设施模板（参考大QMT代码/小市值基础策略V2）
