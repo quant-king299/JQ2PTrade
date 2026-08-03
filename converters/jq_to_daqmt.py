@@ -350,6 +350,9 @@ class JQToDaQmtConverter:
         # _get_all_securities( → get_all_securities(
         body = body.replace('_get_all_securities(', 'get_all_securities(')
 
+        # current_dt → gvar._today_dt (回测/实盘通用当前bar时间)
+        body = body.replace('current_dt', 'gvar._today_dt')
+
         # API 名称映射（最长优先）
         sorted_apis = sorted(self.api_mapping.items(), key=lambda x: -len(x[0]))
         for jq_api, daqmt_api in sorted_apis:
@@ -976,6 +979,7 @@ class JQToDaQmtConverter:
         parts.append('    today = timetag_to_datetime('
                       "ContextInfo.get_bar_timetag(ContextInfo.barpos), '%Y%m%d')")
         parts.append(f"    print(f'---{{today}}---')")
+        parts.append('    gvar._today_dt = datetime.strptime(today, \"%Y%m%d\")')
         parts.append('')
 
         # 回测时：按顺序调用 run_daily 注册的函数
