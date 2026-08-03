@@ -357,8 +357,8 @@ class JQToDaQmtConverter:
         # getattr(g, / hasattr(g, → gvar
         body = body.replace('getattr(g,', 'getattr(gvar,')
         body = body.replace('hasattr(g,', 'hasattr(gvar,')
-        # previous_date → _previous_date(ContextInfo)
-        body = body.replace('previous_date', '_previous_date(ContextInfo)')
+        # previous_date → _previous_date(ContextInfo) (but not def _previous_date)
+        body = re.sub(r'(?<!def _)previous_date', '_previous_date(ContextInfo)', body)
         # context.current_dt 也已在前面的 context_access 中处理
 
         # API 名称映射（最长优先）
